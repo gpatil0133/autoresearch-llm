@@ -58,19 +58,20 @@ CANONICAL_DATASET_COLUMNS = {
     "split": False,
     "language": False,
     "raw_text": True,
-    "overall_sentiment": True,
-    "overall_sentiment_score": True,
-    "sentence_sentiments": True,
-    "metadata_entities": True,
-    "themes": True,
-    "emotions": True,
+    "response_text": False,
+    "overall_sentiment": False,
+    "overall_sentiment_score": False,
+    "sentence_sentiments": False,
+    "metadata": False,
+    "main_themes": False,
 }
 
 COLUMN_ALIASES = {
     "example_id": ("example_id", "id", "record_id"),
     "split": ("split", "dataset_split"),
     "language": ("language", "lang", "locale"),
-    "raw_text": ("raw_text", "text", "survey_text", "response_text", "response"),
+    "raw_text": ("request_text", "raw_text", "text", "survey_text", "response"),
+    "response_text": ("response_text", "analysis_json", "label_json", "analysis"),
     "overall_sentiment": ("overall_sentiment", "sentiment", "document_sentiment"),
     "overall_sentiment_score": (
         "overall_sentiment_score",
@@ -78,9 +79,8 @@ COLUMN_ALIASES = {
         "document_sentiment_score",
     ),
     "sentence_sentiments": ("sentence_sentiments", "sentences", "sentence_annotations"),
-    "metadata_entities": ("metadata_entities", "metadata", "entities", "entity_spans"),
-    "themes": ("themes", "theme_labels", "theme_annotations"),
-    "emotions": ("emotions", "emotion_labels", "emotion_annotations"),
+    "metadata": ("metadata", "metadata_entities", "entities", "entity_spans"),
+    "main_themes": ("main_themes", "themes", "theme_labels", "theme_annotations"),
 }
 
 DEFAULT_VAL_METRIC_WEIGHTS = {
@@ -120,105 +120,67 @@ class ModelFamily(str, Enum):
     ENCODER = "encoder"
 
 
-class PhraseSpan(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    text: str = Field(min_length=1)
-    start_char: int | None = Field(default=None, ge=0)
-    end_char: int | None = Field(default=None, ge=0)
-
-    @field_validator("end_char")
-    @classmethod
-    def validate_bounds(cls, value: int | None, info: Any) -> int | None:
-        start_char = info.data.get("start_char")
-        if value is not None and start_char is not None and value <= start_char:
-            raise ValueError("end_char must be greater than start_char")
-        return value
-
-
-class OverallSentiment(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    sentiment: SentimentLabel
-    score: float = Field(ge=-1.0, le=1.0)
-
-
 class SentenceSentiment(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     sentence: str = Field(min_length=1)
-    sentiment: SentimentLabel
-    score: float = Field(ge=-1.0, le=1.0)
-    start_char: int | None = Field(default=None, ge=0)
-    end_char: int | None = Field(default=None, ge=0)
-
-    @field_validator("end_char")
-    @classmethod
-    def validate_sentence_bounds(cls, value: int | None, info: Any) -> int | None:
-        start_char = info.data.get("start_char")
-        if value is not None and start_char is not None and value <= start_char:
-            raise ValueError("end_char must be greater than start_char")
-        return value
+    sentence_sentiment: SentimentLabel
+    sentence_sentiment_score: float = Field(ge=0.0, le=1.0)
 
 
 class MetadataEntity(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    text: str = Field(min_length=1)
-    entity_type: str = Field(min_length=1)
-    sentiment: SentimentLabel
-    score: float = Field(ge=-1.0, le=1.0)
-    start_char: int = Field(ge=0)
-    end_char: int = Field(ge=1)
+    metadata_type: str = Field(min_length=1)
+    metadata_name: str = Field(min_length=1)
+    metadata_sentiment: SentimentLabel
+    metadata_sentiment_score: float = Field(ge=0.0, le=1.0)
 
-    @field_validator("entity_type")
+    @field_validator("metadata_type")
     @classmethod
     def normalize_entity_type(cls, value: str) -> str:
-        return value.strip().lower()
-
-    @field_validator("end_char")
-    @classmethod
-    def validate_entity_bounds(cls, value: int, info: Any) -> int:
-        start_char = info.data.get("start_char")
-        if start_char is not None and value <= start_char:
-            raise ValueError("end_char must be greater than start_char")
-        return value
+        return value.strip()
 
 
 class ThemeAnnotation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     theme: str = Field(min_length=1)
-    relevance: float = Field(ge=0.0, le=1.0)
-    theme_associated_phrases: list[PhraseSpan] = Field(default_factory=list)
+    theme_sentiment: SentimentLabel
+    theme_sentiment_score: float = Field(ge=0.0, le=1.0)
+    theme_relevance_score: float = Field(ge=0.0, le=1.0)
+    emotion: str = Field(min_length=1)
+    emotion_sentiment: SentimentLabel
+    emotion_intensity_score: float = Field(ge=0.0, le=1.0)
+    theme_associated_phrases: list[str] = Field(default_factory=list)
 
     @field_validator("theme")
     @classmethod
     def normalize_theme(cls, value: str) -> str:
-        return value.strip().lower()
-
-
-class EmotionAnnotation(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    emotion: str = Field(min_length=1)
-    intensity: float = Field(ge=0.0, le=1.0)
-    emotion_associated_phrases: list[PhraseSpan] = Field(default_factory=list)
+        return value.strip()
 
     @field_validator("emotion")
     @classmethod
     def normalize_emotion(cls, value: str) -> str:
-        return value.strip().lower()
+        return value.strip()
+
+    @field_validator("theme_associated_phrases")
+    @classmethod
+    def normalize_phrases(cls, value: list[str]) -> list[str]:
+        phrases = [item.strip() for item in value if item and item.strip()]
+        if not phrases:
+            raise ValueError("theme_associated_phrases must contain at least one phrase")
+        return phrases
 
 
 class TextAnalysis(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    overall_sentiment: OverallSentiment
+    overall_sentiment: SentimentLabel
+    sentiment_score: float = Field(ge=0.0, le=1.0)
+    main_themes: list[ThemeAnnotation] = Field(default_factory=list)
     sentence_sentiments: list[SentenceSentiment] = Field(default_factory=list)
-    metadata_entities: list[MetadataEntity] = Field(default_factory=list)
-    themes: list[ThemeAnnotation] = Field(default_factory=list)
-    emotions: list[EmotionAnnotation] = Field(default_factory=list)
+    metadata: list[MetadataEntity] = Field(default_factory=list)
 
 
 class TextAnalysisEnvelope(BaseModel):
@@ -316,6 +278,10 @@ def _lookup_column(columns: Sequence[str], canonical_name: str) -> str | None:
     return None
 
 
+def _normalize_label_text(value: str) -> str:
+    return value.strip().lower()
+
+
 def _derive_span_text(raw_text: str, text: str | None, start_char: int | None, end_char: int | None) -> str:
     if start_char is not None and end_char is not None:
         extracted = raw_text[start_char:end_char]
@@ -331,18 +297,18 @@ def _derive_span_text(raw_text: str, text: str | None, start_char: int | None, e
     return text
 
 
-def _normalize_phrase_spans(raw_text: str, value: Any) -> list[PhraseSpan]:
+def _normalize_phrase_texts(raw_text: str, value: Any) -> list[str]:
     payload = _coerce_json(value, default=[])
-    spans: list[PhraseSpan] = []
+    phrases: list[str] = []
     for item in payload:
         if isinstance(item, str):
-            spans.append(PhraseSpan(text=item))
+            phrases.append(item)
             continue
         start_char = item.get("start_char", item.get("start", item.get("begin")))
         end_char = item.get("end_char", item.get("end", item.get("stop")))
         text = _derive_span_text(raw_text, item.get("text"), start_char, end_char)
-        spans.append(PhraseSpan(text=text, start_char=start_char, end_char=end_char))
-    return spans
+        phrases.append(text)
+    return phrases
 
 
 def _normalize_sentence_sentiments(raw_text: str, value: Any) -> list[SentenceSentiment]:
@@ -355,44 +321,75 @@ def _normalize_sentence_sentiments(raw_text: str, value: Any) -> list[SentenceSe
         annotations.append(
             SentenceSentiment(
                 sentence=sentence,
-                sentiment=_normalize_sentiment(item.get("sentiment")),
-                score=float(item.get("score", 0.0)),
-                start_char=start_char,
-                end_char=end_char,
+                sentence_sentiment=_normalize_sentiment(
+                    item.get("sentence_sentiment", item.get("sentiment"))
+                ),
+                sentence_sentiment_score=float(
+                    item.get("sentence_sentiment_score", item.get("score", 0.0))
+                ),
             )
         )
     return annotations
 
 
-def _normalize_metadata_entities(raw_text: str, value: Any) -> list[MetadataEntity]:
+def _normalize_metadata(raw_text: str, value: Any) -> list[MetadataEntity]:
     payload = _coerce_json(value, default=[])
     annotations: list[MetadataEntity] = []
     for item in payload:
         start_char = item.get("start_char", item.get("start"))
         end_char = item.get("end_char", item.get("end"))
-        text = _derive_span_text(raw_text, item.get("text"), start_char, end_char)
+        text = _derive_span_text(
+            raw_text,
+            item.get("metadata_name", item.get("text")),
+            start_char,
+            end_char,
+        )
         annotations.append(
             MetadataEntity(
-                text=text,
-                entity_type=item.get("entity_type", item.get("type")),
-                sentiment=_normalize_sentiment(item.get("sentiment")),
-                score=float(item.get("score", 0.0)),
-                start_char=int(start_char),
-                end_char=int(end_char),
+                metadata_type=item.get("metadata_type", item.get("entity_type", item.get("type"))),
+                metadata_name=text,
+                metadata_sentiment=_normalize_sentiment(
+                    item.get("metadata_sentiment", item.get("sentiment"))
+                ),
+                metadata_sentiment_score=float(
+                    item.get("metadata_sentiment_score", item.get("score", 0.0))
+                ),
             )
         )
     return annotations
 
 
-def _normalize_themes(raw_text: str, value: Any) -> list[ThemeAnnotation]:
+def _normalize_main_themes(raw_text: str, value: Any) -> list[ThemeAnnotation]:
     payload = _coerce_json(value, default=[])
     annotations: list[ThemeAnnotation] = []
     for item in payload:
+        emotion_payload = item.get("emotion")
+        emotion_label = emotion_payload
+        emotion_sentiment = item.get("emotion_sentiment")
+        emotion_intensity_score = item.get("emotion_intensity_score", 1.0)
+        if isinstance(emotion_payload, Mapping):
+            emotion_label = emotion_payload.get("emotion")
+            emotion_sentiment = emotion_payload.get("emotion_sentiment", emotion_payload.get("sentiment"))
+            emotion_intensity_score = emotion_payload.get(
+                "emotion_intensity_score",
+                emotion_payload.get("intensity", 1.0),
+            )
         annotations.append(
             ThemeAnnotation(
                 theme=item.get("theme"),
-                relevance=float(item.get("relevance", 1.0)),
-                theme_associated_phrases=_normalize_phrase_spans(
+                theme_sentiment=_normalize_sentiment(
+                    item.get("theme_sentiment", item.get("sentiment"))
+                ),
+                theme_sentiment_score=float(
+                    item.get("theme_sentiment_score", item.get("score", 0.0))
+                ),
+                theme_relevance_score=float(
+                    item.get("theme_relevance_score", item.get("relevance", 1.0))
+                ),
+                emotion=str(emotion_label).strip(),
+                emotion_sentiment=_normalize_sentiment(emotion_sentiment),
+                emotion_intensity_score=float(emotion_intensity_score),
+                theme_associated_phrases=_normalize_phrase_texts(
                     raw_text,
                     item.get("theme_associated_phrases", item.get("associated_phrases", [])),
                 ),
@@ -401,46 +398,94 @@ def _normalize_themes(raw_text: str, value: Any) -> list[ThemeAnnotation]:
     return annotations
 
 
-def _normalize_emotions(raw_text: str, value: Any) -> list[EmotionAnnotation]:
-    payload = _coerce_json(value, default=[])
-    annotations: list[EmotionAnnotation] = []
-    for item in payload:
-        annotations.append(
-            EmotionAnnotation(
-                emotion=item.get("emotion"),
-                intensity=float(item.get("intensity", 1.0)),
-                emotion_associated_phrases=_normalize_phrase_spans(
-                    raw_text,
-                    item.get("emotion_associated_phrases", item.get("associated_phrases", [])),
-                ),
+def _normalize_analysis_payload(raw_text: str, payload: Mapping[str, Any] | str) -> TextAnalysisEnvelope:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    analysis_payload = payload.get("text_analysis", payload)
+
+    overall_sentiment = analysis_payload.get("overall_sentiment")
+    sentiment_score = analysis_payload.get(
+        "sentiment_score",
+        analysis_payload.get("overall_sentiment_score"),
+    )
+    if isinstance(overall_sentiment, Mapping):
+        sentiment_score = overall_sentiment.get("score", sentiment_score)
+        overall_sentiment = overall_sentiment.get("sentiment", overall_sentiment.get("label"))
+
+    sentence_payload = analysis_payload.get("sentence_sentiments", [])
+    metadata_payload = analysis_payload.get("metadata", analysis_payload.get("metadata_entities", []))
+    theme_payload = analysis_payload.get("main_themes", analysis_payload.get("themes", []))
+    legacy_emotions = _coerce_json(analysis_payload.get("emotions"), default=[])
+
+    if analysis_payload.get("themes") and legacy_emotions and "main_themes" not in analysis_payload:
+        combined_themes: list[dict[str, Any]] = []
+        for index, theme in enumerate(_coerce_json(analysis_payload.get("themes"), default=[])):
+            emotion = legacy_emotions[index] if index < len(legacy_emotions) else {}
+            combined_themes.append(
+                {
+                    "theme": theme.get("theme"),
+                    "theme_sentiment": theme.get("theme_sentiment", theme.get("sentiment", overall_sentiment)),
+                    "theme_sentiment_score": theme.get("theme_sentiment_score", theme.get("score", 0.0)),
+                    "theme_relevance_score": theme.get("theme_relevance_score", theme.get("relevance", 1.0)),
+                    "emotion": emotion.get("emotion"),
+                    "emotion_sentiment": emotion.get(
+                        "emotion_sentiment",
+                        emotion.get("sentiment", overall_sentiment),
+                    ),
+                    "emotion_intensity_score": emotion.get(
+                        "emotion_intensity_score",
+                        emotion.get("intensity", 1.0),
+                    ),
+                    "theme_associated_phrases": theme.get(
+                        "theme_associated_phrases",
+                        theme.get("associated_phrases", []),
+                    ),
+                }
             )
+        theme_payload = combined_themes
+
+    return TextAnalysisEnvelope(
+        text_analysis=TextAnalysis(
+            overall_sentiment=_normalize_sentiment(overall_sentiment),
+            sentiment_score=float(sentiment_score),
+            main_themes=_normalize_main_themes(raw_text, theme_payload),
+            sentence_sentiments=_normalize_sentence_sentiments(raw_text, sentence_payload),
+            metadata=_normalize_metadata(raw_text, metadata_payload),
         )
-    return annotations
+    )
+
+
+def _has_legacy_analysis_columns(row: Mapping[str, Any]) -> bool:
+    return any(
+        not _is_missing(row.get(name))
+        for name in ("overall_sentiment", "sentence_sentiments", "metadata", "main_themes")
+    )
 
 
 def _normalize_row(row: Mapping[str, Any], index: int) -> SurveyExample:
     raw_text = str(row["raw_text"]).strip()
     example_id = str(row.get("example_id") or f"example-{index:06d}")
-    overall_payload = row["overall_sentiment"]
-    overall_sentiment = (
-        overall_payload.get("sentiment") if isinstance(overall_payload, dict) else overall_payload
-    )
-    overall_score = row["overall_sentiment_score"]
-    if isinstance(overall_payload, dict) and "score" in overall_payload:
-        overall_score = overall_payload["score"]
-
-    analysis = TextAnalysisEnvelope(
-        text_analysis=TextAnalysis(
-            overall_sentiment=OverallSentiment(
-                sentiment=_normalize_sentiment(overall_sentiment),
-                score=float(overall_score),
-            ),
-            sentence_sentiments=_normalize_sentence_sentiments(raw_text, row["sentence_sentiments"]),
-            metadata_entities=_normalize_metadata_entities(raw_text, row["metadata_entities"]),
-            themes=_normalize_themes(raw_text, row["themes"]),
-            emotions=_normalize_emotions(raw_text, row["emotions"]),
+    response_text = row.get("response_text")
+    if not _is_missing(response_text):
+        analysis = _normalize_analysis_payload(raw_text, response_text)
+    elif _has_legacy_analysis_columns(row):
+        analysis = _normalize_analysis_payload(
+            raw_text,
+            {
+                "text_analysis": {
+                    "overall_sentiment": row.get("overall_sentiment"),
+                    "sentiment_score": row.get("overall_sentiment_score", 0.0),
+                    "sentence_sentiments": row.get("sentence_sentiments", []),
+                    "metadata": row.get("metadata", []),
+                    "main_themes": row.get("main_themes", []),
+                }
+            },
         )
-    )
+    else:
+        raise ValueError(
+            "Each dataset row must include response_text or legacy annotation columns."
+        )
 
     language = row.get("language")
     return SurveyExample(
@@ -471,6 +516,23 @@ def load_survey_dataframe(csv_path: str | Path | None = None) -> list[dict[str, 
             continue
         rename_map[source_name] = canonical_name
 
+    if "raw_text" not in rename_map.values():
+        raise ValueError(
+            "Missing required dataset column for source survey text. Accepted aliases: "
+            f"{COLUMN_ALIASES['raw_text']}"
+        )
+
+    has_response_text = "response_text" in rename_map.values()
+    has_legacy_columns = any(
+        _lookup_column(source_columns, name) is not None
+        for name in ("overall_sentiment", "sentence_sentiments", "metadata", "main_themes")
+    )
+    if not has_response_text and not has_legacy_columns:
+        raise ValueError(
+            "Dataset must include response_text or legacy annotation columns. "
+            f"Accepted response_text aliases: {COLUMN_ALIASES['response_text']}"
+        )
+
     normalized_rows: list[dict[str, Any]] = []
     for row in rows:
         normalized_row = {canonical: row.get(source) for source, canonical in rename_map.items()}
@@ -492,9 +554,7 @@ def serialize_text_analysis(envelope: TextAnalysisEnvelope, *, indent: int | Non
 
 
 def validate_text_analysis_payload(payload: Mapping[str, Any] | str) -> TextAnalysisEnvelope:
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    return TextAnalysisEnvelope.model_validate(payload)
+    return _normalize_analysis_payload(raw_text="", payload=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +585,7 @@ def build_overall_sentiment_targets(examples: Sequence[SurveyExample]) -> Any:
     torch = _require_torch()
     label_to_id = {label.value: index for index, label in enumerate(SentimentLabel)}
     return torch.tensor(
-        [label_to_id[example.analysis.text_analysis.overall_sentiment.sentiment.value] for example in examples],
+        [label_to_id[example.analysis.text_analysis.overall_sentiment.value] for example in examples],
         dtype=torch.long,
     )
 
@@ -544,13 +604,17 @@ def build_theme_multilabel_targets(
     torch = _require_torch()
     vocabulary = sorted(
         set(label_vocabulary or [])
-        | {theme.theme for example in examples for theme in example.analysis.text_analysis.themes}
+        | {
+            _normalize_label_text(theme.theme)
+            for example in examples
+            for theme in example.analysis.text_analysis.main_themes
+        }
     )
     index = {label: idx for idx, label in enumerate(vocabulary)}
     targets = torch.zeros((len(examples), len(vocabulary)), dtype=torch.float32)
     for row_index, example in enumerate(examples):
-        for annotation in example.analysis.text_analysis.themes:
-            targets[row_index, index[annotation.theme]] = 1.0
+        for annotation in example.analysis.text_analysis.main_themes:
+            targets[row_index, index[_normalize_label_text(annotation.theme)]] = 1.0
     return targets, vocabulary
 
 
@@ -561,14 +625,35 @@ def build_emotion_multilabel_targets(
     torch = _require_torch()
     vocabulary = sorted(
         set(label_vocabulary or [])
-        | {emotion.emotion for example in examples for emotion in example.analysis.text_analysis.emotions}
+        | {
+            _normalize_label_text(theme.emotion)
+            for example in examples
+            for theme in example.analysis.text_analysis.main_themes
+        }
     )
     index = {label: idx for idx, label in enumerate(vocabulary)}
     targets = torch.zeros((len(examples), len(vocabulary)), dtype=torch.float32)
     for row_index, example in enumerate(examples):
-        for annotation in example.analysis.text_analysis.emotions:
-            targets[row_index, index[annotation.emotion]] = 1.0
+        for annotation in example.analysis.text_analysis.main_themes:
+            targets[row_index, index[_normalize_label_text(annotation.emotion)]] = 1.0
     return targets, vocabulary
+
+
+def _find_text_span(raw_text: str, text: str) -> tuple[int, int] | None:
+    start_char = raw_text.find(text)
+    if start_char < 0:
+        return None
+    return start_char, start_char + len(text)
+
+
+def _metadata_target_annotations(example: SurveyExample) -> list[tuple[str, int, int]]:
+    annotations: list[tuple[str, int, int]] = []
+    for entity in example.analysis.text_analysis.metadata:
+        span = _find_text_span(example.raw_text, entity.metadata_name)
+        if span is None:
+            continue
+        annotations.append((_normalize_label_text(entity.metadata_type), span[0], span[1]))
+    return annotations
 
 
 def build_metadata_token_targets(
@@ -578,8 +663,12 @@ def build_metadata_token_targets(
 ) -> tuple[list[Any], list[str]]:
     torch = _require_torch()
     vocabulary = sorted(
-        set(entity_types or [])
-        | {entity.entity_type for example in examples for entity in example.analysis.text_analysis.metadata_entities}
+        {_normalize_label_text(item) for item in (entity_types or [])}
+        | {
+            _normalize_label_text(entity.metadata_type)
+            for example in examples
+            for entity in example.analysis.text_analysis.metadata
+        }
     )
     label_names = ["O"]
     for entity_type in vocabulary:
@@ -589,6 +678,7 @@ def build_metadata_token_targets(
     token_targets: list[torch.Tensor] = []
     for example, offsets in zip(examples, offset_mappings):
         labels = torch.full((len(offsets),), fill_value=-100, dtype=torch.long)
+        annotations = _metadata_target_annotations(example)
         for token_index, offset in enumerate(offsets):
             if offset is None or len(offset) != 2:
                 continue
@@ -596,10 +686,10 @@ def build_metadata_token_targets(
             if start_char == end_char:
                 continue
             labels[token_index] = label_to_id["O"]
-            for entity in example.analysis.text_analysis.metadata_entities:
-                if start_char >= entity.start_char and end_char <= entity.end_char:
-                    prefix = "B" if start_char == entity.start_char else "I"
-                    labels[token_index] = label_to_id[f"{prefix}-{entity.entity_type}"]
+            for entity_type, entity_start, entity_end in annotations:
+                if start_char >= entity_start and end_char <= entity_end:
+                    prefix = "B" if start_char == entity_start else "I"
+                    labels[token_index] = label_to_id[f"{prefix}-{entity_type}"]
                     break
         token_targets.append(labels)
     return token_targets, label_names
@@ -753,6 +843,30 @@ def _safe_validate_prediction(payload: Mapping[str, Any] | str) -> tuple[TextAna
         return None, False
 
 
+def _sentence_label_map(items: Sequence[SentenceSentiment]) -> dict[str, str]:
+    return {
+        item.sentence.strip(): item.sentence_sentiment.value
+        for item in items
+        if item.sentence.strip()
+    }
+
+
+def _metadata_metric_sets(raw_text: str, items: Sequence[MetadataEntity]) -> tuple[set[Any], set[Any]]:
+    spans: set[Any] = set()
+    typed: set[Any] = set()
+    for item in items:
+        span = _find_text_span(raw_text, item.metadata_name)
+        normalized_type = _normalize_label_text(item.metadata_type)
+        normalized_name = item.metadata_name.strip()
+        if span is None:
+            spans.add((normalized_name,))
+            typed.add((normalized_name, normalized_type))
+            continue
+        spans.add(span)
+        typed.add((span[0], span[1], normalized_type))
+    return spans, typed
+
+
 def score_predictions(
     references: Sequence[SurveyExample],
     predictions: Sequence[Mapping[str, Any] | str],
@@ -769,51 +883,57 @@ def score_predictions(
         valid_predictions.append(validated)
         valid_flags.append(is_valid)
 
-    overall_gold = [example.analysis.text_analysis.overall_sentiment.sentiment.value for example in references]
+    overall_gold = [example.analysis.text_analysis.overall_sentiment.value for example in references]
     overall_pred = [
-        prediction.text_analysis.overall_sentiment.sentiment.value if prediction else "invalid"
+        prediction.text_analysis.overall_sentiment.value if prediction else "invalid"
         for prediction in valid_predictions
     ]
 
     sentence_gold: list[str] = []
     sentence_pred: list[str] = []
-    metadata_gold_spans: list[set[tuple[int, int]]] = []
-    metadata_pred_spans: list[set[tuple[int, int]]] = []
-    metadata_gold_typed: list[set[tuple[int, int, str]]] = []
-    metadata_pred_typed: list[set[tuple[int, int, str]]] = []
+    metadata_gold_spans: list[set[Any]] = []
+    metadata_pred_spans: list[set[Any]] = []
+    metadata_gold_typed: list[set[Any]] = []
+    metadata_pred_typed: list[set[Any]] = []
     theme_gold: list[set[str]] = []
     theme_pred: list[set[str]] = []
     emotion_gold: list[set[str]] = []
     emotion_pred: list[set[str]] = []
 
     for example, prediction in zip(references, valid_predictions):
-        gold_sentences = {
-            (item.start_char, item.end_char): item.sentiment.value
-            for item in example.analysis.text_analysis.sentence_sentiments
-            if item.start_char is not None and item.end_char is not None
-        }
-        predicted_sentences = {}
-        if prediction is not None:
-            predicted_sentences = {
-                (item.start_char, item.end_char): item.sentiment.value
-                for item in prediction.text_analysis.sentence_sentiments
-                if item.start_char is not None and item.end_char is not None
-            }
+        gold_sentences = _sentence_label_map(example.analysis.text_analysis.sentence_sentiments)
+        predicted_sentences = (
+            _sentence_label_map(prediction.text_analysis.sentence_sentiments) if prediction is not None else {}
+        )
         aligned_keys = sorted(set(gold_sentences) | set(predicted_sentences))
         for key in aligned_keys:
             sentence_gold.append(gold_sentences.get(key, "missing"))
             sentence_pred.append(predicted_sentences.get(key, "missing"))
 
-        gold_entities = example.analysis.text_analysis.metadata_entities
-        pred_entities = prediction.text_analysis.metadata_entities if prediction else []
-        metadata_gold_spans.append({(item.start_char, item.end_char) for item in gold_entities})
-        metadata_pred_spans.append({(item.start_char, item.end_char) for item in pred_entities})
-        metadata_gold_typed.append({(item.start_char, item.end_char, item.entity_type) for item in gold_entities})
-        metadata_pred_typed.append({(item.start_char, item.end_char, item.entity_type) for item in pred_entities})
-        theme_gold.append({item.theme for item in example.analysis.text_analysis.themes})
-        theme_pred.append({item.theme for item in prediction.text_analysis.themes} if prediction else set())
-        emotion_gold.append({item.emotion for item in example.analysis.text_analysis.emotions})
-        emotion_pred.append({item.emotion for item in prediction.text_analysis.emotions} if prediction else set())
+        gold_spans, gold_typed = _metadata_metric_sets(example.raw_text, example.analysis.text_analysis.metadata)
+        pred_spans, pred_typed = (
+            _metadata_metric_sets(example.raw_text, prediction.text_analysis.metadata) if prediction else (set(), set())
+        )
+        metadata_gold_spans.append(gold_spans)
+        metadata_pred_spans.append(pred_spans)
+        metadata_gold_typed.append(gold_typed)
+        metadata_pred_typed.append(pred_typed)
+        theme_gold.append(
+            {_normalize_label_text(item.theme) for item in example.analysis.text_analysis.main_themes}
+        )
+        theme_pred.append(
+            {_normalize_label_text(item.theme) for item in prediction.text_analysis.main_themes}
+            if prediction
+            else set()
+        )
+        emotion_gold.append(
+            {_normalize_label_text(item.emotion) for item in example.analysis.text_analysis.main_themes}
+        )
+        emotion_pred.append(
+            {_normalize_label_text(item.emotion) for item in prediction.text_analysis.main_themes}
+            if prediction
+            else set()
+        )
 
     metadata_precision, metadata_recall, metadata_f1 = _span_metrics(metadata_gold_spans, metadata_pred_spans)
     typed_precision, typed_recall, typed_f1 = _span_metrics(metadata_gold_typed, metadata_pred_typed)
@@ -860,11 +980,10 @@ def dataset_contract() -> dict[str, Any]:
     return {
         "path": str(DEFAULT_DATASET_PATH),
         "schema_version": TEXT_ANALYSIS_SCHEMA_VERSION,
-        "required_columns": [
-            canonical for canonical, required in CANONICAL_DATASET_COLUMNS.items() if required
-        ],
-        "optional_columns": [
-            canonical for canonical, required in CANONICAL_DATASET_COLUMNS.items() if not required
+        "required_csv_columns": ["request_text", "response_text"],
+        "optional_csv_columns": ["example_id", "split", "language"],
+        "normalized_fields": [
+            canonical for canonical in CANONICAL_DATASET_COLUMNS
         ],
         "column_aliases": COLUMN_ALIASES,
         "top_level_json_key": "text_analysis",
@@ -877,13 +996,17 @@ def summarize_dataset(splits: DatasetSplits) -> dict[str, Any]:
         "val_examples": len(splits.val),
         "test_examples": len(splits.test),
         "entity_types": sorted(
-            {entity.entity_type for example in splits.all for entity in example.analysis.text_analysis.metadata_entities}
+            {
+                entity.metadata_type
+                for example in splits.all
+                for entity in example.analysis.text_analysis.metadata
+            }
         ),
         "themes": sorted(
-            {theme.theme for example in splits.all for theme in example.analysis.text_analysis.themes}
+            {theme.theme for example in splits.all for theme in example.analysis.text_analysis.main_themes}
         ),
         "emotions": sorted(
-            {emotion.emotion for example in splits.all for emotion in example.analysis.text_analysis.emotions}
+            {theme.emotion for example in splits.all for theme in example.analysis.text_analysis.main_themes}
         ),
     }
 
