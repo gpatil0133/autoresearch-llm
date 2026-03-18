@@ -1,630 +1,812 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Phase-3 training baseline for survey autoresearch.
+
+This script replaces legacy custom GPT pretraining with a fixed-budget
+fine-tuning driver that supports:
+- Decoder path: supervised JSON-generation fine-tuning.
+- Encoder path: multi-head classification/token-label fine-tuning.
+
+Both paths report higher-is-better `val_metric` and emit grep-friendly
+summary keys for automated experiment orchestration.
 """
 
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from __future__ import annotations
 
-import gc
-import math
+import json
+import os
+import random
+import re
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-
-# ---------------------------------------------------------------------------
-# GPT Model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
-
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-        # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    @torch.no_grad()
-    def init_weights(self):
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
-
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
-    def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
-
-    def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
-        }
-
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
-
-    def forward(self, idx, targets=None, reduction='mean'):
-        B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
-
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
-        return logits
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
-# ---------------------------------------------------------------------------
-
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
-
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
-
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
-
-
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
-
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
-
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
-
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
+from model_selector import SelectionStrategy, list_registry, select_model
+from prepare import (
+    MAX_SEQ_LEN,
+    TIME_BUDGET,
+    DECODER_PROMPT_TEMPLATE,
+    ModelFamily,
+    SentimentLabel,
+    SurveyExample,
+    compute_validation_score,
+    load_dataset_splits,
+    make_dataloader,
+    score_predictions,
 )
 
-model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+# ---------------------------------------------------------------------------
+# Shared experiment knobs (autonomous loop edits these)
+# ---------------------------------------------------------------------------
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+EXPERIMENT_INDEX = 0
+SELECTION_STRATEGY = SelectionStrategy.ROUND_ROBIN
+MODEL_REGISTRY_ID: str | None = None
+RUN_TAG = "phase3"
+RANDOM_SEED = 17
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+TRAIN_BATCH_SIZE_OVERRIDE: int | None = None
+LEARNING_RATE_OVERRIDE: float | None = None
+MAX_SEQUENCE_LENGTH_OVERRIDE: int | None = None
+USE_LORA_OVERRIDE: bool | None = None
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+WEIGHT_DECAY = 0.01
+GRAD_CLIP_NORM = 1.0
+WARMUP_STEPS = 5
+TIME_BUDGET_WARMUP_STEPS = 1
+LOG_EVERY_STEPS = 1
+
+EVAL_BATCH_SIZE = 4
+DECODER_MAX_NEW_TOKENS = 512
+DECODER_GENERATION_TEMPERATURE = 0.0
+DECODER_TOP_P = 1.0
+MULTILABEL_THRESHOLD = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Runtime data classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    experiment_index: int
+    run_tag: str
+    strategy: str
+    model_registry_id: str
+    model_name: str
+    model_family: str
+    learning_rate: float
+    batch_size: int
+    max_sequence_length: int
+    use_lora: bool
+
+
+@dataclass
+class TrainState:
+    step: int = 0
+    steady_training_seconds: float = 0.0
+    running_loss: float = 0.0
+
+
+class EncoderSurveyModel(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        hidden_size: int,
+        num_overall_labels: int,
+        num_metadata_labels: int,
+        num_theme_labels: int,
+        num_emotion_labels: int,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.dropout = nn.Dropout(0.1)
+        self.overall_classifier = nn.Linear(hidden_size, num_overall_labels)
+        self.metadata_classifier = nn.Linear(hidden_size, num_metadata_labels)
+        self.theme_classifier = nn.Linear(hidden_size, num_theme_labels)
+        self.emotion_classifier = nn.Linear(hidden_size, num_emotion_labels)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = self.dropout(outputs.last_hidden_state)
+        pooled_output = sequence_output[:, 0, :]
+        return {
+            "overall_logits": self.overall_classifier(pooled_output),
+            "metadata_logits": self.metadata_classifier(sequence_output),
+            "theme_logits": self.theme_classifier(pooled_output),
+            "emotion_logits": self.emotion_classifier(pooled_output),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _autocast_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return torch.amp.autocast(device_type="cpu", dtype=torch.float32, enabled=False)
+
+
+def _resolve_selected_model() -> Any:
+    selected = select_model(
+        experiment_index=EXPERIMENT_INDEX,
+        strategy=SelectionStrategy(SELECTION_STRATEGY),
+        random_seed=RANDOM_SEED,
+    )
+    if MODEL_REGISTRY_ID is None:
+        return selected
+
+    for item in list_registry():
+        if item["registry_id"] == MODEL_REGISTRY_ID:
+            class _Selected:
+                pass
+
+            resolved = _Selected()
+            resolved.strategy = SelectionStrategy(SELECTION_STRATEGY)
+            resolved.experiment_index = EXPERIMENT_INDEX
+            resolved.spec = type("Spec", (), {
+                "registry_id": item["registry_id"],
+                "hf_model_name": item["hf_model_name"],
+                "family": ModelFamily(item["family"]),
+            })
+            resolved.config = dict(item["defaults"])
+            return resolved
+    raise ValueError(f"MODEL_REGISTRY_ID not found in registry: {MODEL_REGISTRY_ID}")
+
+
+def _runtime_config(selected: Any) -> RuntimeConfig:
+    selected_config = dict(selected.config)
+    learning_rate = float(LEARNING_RATE_OVERRIDE or selected_config["learning_rate"])
+    batch_size = int(TRAIN_BATCH_SIZE_OVERRIDE or selected_config["batch_size"])
+    max_sequence_length = int(MAX_SEQUENCE_LENGTH_OVERRIDE or selected_config["max_sequence_length"])
+    use_lora = bool(selected_config["use_lora"] if USE_LORA_OVERRIDE is None else USE_LORA_OVERRIDE)
+
+    return RuntimeConfig(
+        experiment_index=EXPERIMENT_INDEX,
+        run_tag=RUN_TAG,
+        strategy=str(selected.strategy.value),
+        model_registry_id=selected.spec.registry_id,
+        model_name=selected.spec.hf_model_name,
+        model_family=selected.spec.family.value,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        max_sequence_length=min(max_sequence_length, MAX_SEQ_LEN),
+        use_lora=use_lora,
+    )
+
+
+def _pad_token_labels(token_targets: list[torch.Tensor], seq_len: int, device: torch.device) -> torch.Tensor:
+    labels = torch.full((len(token_targets), seq_len), fill_value=-100, dtype=torch.long, device=device)
+    for row_index, row in enumerate(token_targets):
+        length = min(seq_len, row.shape[0])
+        labels[row_index, :length] = row[:length].to(device)
+    return labels
+
+
+def _extract_json_text(generation_text: str) -> str:
+    text = generation_text.strip()
+    if not text:
+        return ""
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    return match.group(0) if match else text
+
+
+def _prediction_template(
+    example: SurveyExample,
+    *,
+    overall_label: str,
+    overall_score: float,
+    metadata: list[dict[str, Any]],
+    themes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "text_analysis": {
+            "overall_sentiment": overall_label,
+            "sentiment_score": float(max(0.0, min(1.0, overall_score))),
+            "sentence_sentiments": [
+                {
+                    "sentence": sentence.sentence,
+                    "sentence_sentiment": overall_label,
+                    "sentence_sentiment_score": float(max(0.0, min(1.0, overall_score))),
+                }
+                for sentence in example.analysis.text_analysis.sentence_sentiments
+            ],
+            "metadata": metadata,
+            "main_themes": themes,
+        }
+    }
+
+
+def _decode_token_entities(
+    raw_text: str,
+    offsets: Iterable[Iterable[int]],
+    label_ids: Iterable[int],
+    label_names: list[str],
+    sentiment_label: str,
+    sentiment_score: float,
+) -> list[dict[str, Any]]:
+    entities: list[dict[str, Any]] = []
+    current_type: str | None = None
+    current_start: int | None = None
+    current_end: int | None = None
+
+    def flush() -> None:
+        nonlocal current_type, current_start, current_end
+        if current_type is None or current_start is None or current_end is None:
+            return
+        text = raw_text[current_start:current_end].strip()
+        if text:
+            entities.append(
+                {
+                    "metadata_type": current_type,
+                    "metadata_name": text,
+                    "metadata_sentiment": sentiment_label,
+                    "metadata_sentiment_score": float(max(0.0, min(1.0, sentiment_score))),
+                }
+            )
+        current_type = None
+        current_start = None
+        current_end = None
+
+    for offset, label_id in zip(offsets, label_ids):
+        if offset is None or len(offset) != 2:
+            flush()
+            continue
+        start_char, end_char = int(offset[0]), int(offset[1])
+        if start_char == end_char:
+            flush()
+            continue
+        if label_id < 0 or label_id >= len(label_names):
+            flush()
+            continue
+
+        label_name = label_names[label_id]
+        if label_name == "O":
+            flush()
+            continue
+
+        prefix, entity_type = label_name.split("-", 1)
+        if prefix == "B" or current_type != entity_type:
+            flush()
+            current_type = entity_type
+            current_start = start_char
+            current_end = end_char
+        else:
+            current_end = end_char
+
+    flush()
+    return entities
+
+
+def _phrase_for_label(raw_text: str, label: str) -> str:
+    lowered = raw_text.lower()
+    needle = label.lower().strip()
+    if needle:
+        index = lowered.find(needle)
+        if index >= 0:
+            return raw_text[index : index + len(needle)]
+    return raw_text.strip()[: min(80, len(raw_text.strip()))]
+
+
+def _themes_payload(
+    raw_text: str,
+    sentiment_label: str,
+    sentiment_score: float,
+    theme_labels: list[str],
+    theme_probs: torch.Tensor,
+    emotion_labels: list[str],
+    emotion_probs: torch.Tensor,
+) -> list[dict[str, Any]]:
+    predicted_theme_indices = [
+        idx for idx, prob in enumerate(theme_probs.tolist()) if prob >= MULTILABEL_THRESHOLD
+    ]
+    predicted_emotion_indices = [
+        idx for idx, prob in enumerate(emotion_probs.tolist()) if prob >= MULTILABEL_THRESHOLD
+    ]
+
+    if not predicted_theme_indices and theme_probs.numel() > 0:
+        predicted_theme_indices = [int(theme_probs.argmax().item())]
+    if not predicted_emotion_indices and emotion_probs.numel() > 0:
+        predicted_emotion_indices = [int(emotion_probs.argmax().item())]
+
+    emotion_label = emotion_labels[predicted_emotion_indices[0]] if predicted_emotion_indices else "neutral"
+    emotion_score = float(
+        emotion_probs[predicted_emotion_indices[0]].item() if predicted_emotion_indices else sentiment_score
+    )
+
+    themes: list[dict[str, Any]] = []
+    for index in predicted_theme_indices:
+        theme_label = theme_labels[index]
+        relevance = float(theme_probs[index].item())
+        phrase = _phrase_for_label(raw_text, theme_label)
+        themes.append(
+            {
+                "theme": theme_label,
+                "theme_sentiment": sentiment_label,
+                "theme_sentiment_score": float(max(0.0, min(1.0, sentiment_score))),
+                "theme_relevance_score": float(max(0.0, min(1.0, relevance))),
+                "emotion": emotion_label,
+                "emotion_sentiment": sentiment_label,
+                "emotion_intensity_score": float(max(0.0, min(1.0, emotion_score))),
+                "theme_associated_phrases": [phrase],
+            }
+        )
+    return themes
+
+
+def _summary_print(summary: Mapping[str, Any]) -> None:
+    print("---")
+    ordered_keys = [
+        "val_metric",
+        "json_schema_compliance",
+        "training_seconds",
+        "total_seconds",
+        "peak_vram_mb",
+        "model_name",
+        "model_family",
+        "model_registry_id",
+        "run_tag",
+        "num_steps",
+        "avg_train_loss",
+        "config_json",
+    ]
+    for key in ordered_keys:
+        value = summary.get(key)
+        if isinstance(value, float):
+            print(f"{key}: {value:.6f}")
+        else:
+            print(f"{key}: {value}")
+
+
+# ---------------------------------------------------------------------------
+# Decoder path
+# ---------------------------------------------------------------------------
+
+
+def _build_decoder_model_and_tokenizer(runtime: RuntimeConfig, device: torch.device) -> tuple[Any, Any]:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(runtime.model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(runtime.model_name, torch_dtype=dtype)
+    model.to(device)
+
+    if runtime.use_lora:
+        try:
+            from peft import LoraConfig, get_peft_model
+
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+        except ImportError:
+            print("[warn] peft not installed; continuing without LoRA.")
+
+    return model, tokenizer
+
+
+def _decoder_train_step(
+    model: Any,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    autocast_ctx: Any,
+) -> torch.Tensor:
+    inputs = {
+        "input_ids": batch["input_ids"].to(device),
+        "attention_mask": batch["attention_mask"].to(device),
+        "labels": batch["labels"].to(device),
+    }
+
+    with autocast_ctx:
+        outputs = model(**inputs)
+        loss = outputs.loss
+    loss.backward()
+    return loss.detach()
+
+
+def _decoder_predict(
+    model: Any,
+    tokenizer: Any,
+    examples: list[SurveyExample],
+    runtime: RuntimeConfig,
+    device: torch.device,
+) -> list[Mapping[str, Any] | str]:
+    model.eval()
+    predictions: list[Mapping[str, Any] | str] = []
+
+    for start in range(0, len(examples), EVAL_BATCH_SIZE):
+        batch_examples = examples[start : start + EVAL_BATCH_SIZE]
+        prompts = [DECODER_PROMPT_TEMPLATE.format(raw_text=item.raw_text) for item in batch_examples]
+        tokenized = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=runtime.max_sequence_length,
+        ).to(device)
+
+        with torch.no_grad():
+            generated = model.generate(
+                **tokenized,
+                max_new_tokens=DECODER_MAX_NEW_TOKENS,
+                temperature=DECODER_GENERATION_TEMPERATURE,
+                top_p=DECODER_TOP_P,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        prompt_lengths = tokenized["attention_mask"].sum(dim=1).tolist()
+        for row_index, output_ids in enumerate(generated):
+            generated_ids = output_ids[int(prompt_lengths[row_index]) :]
+            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            json_text = _extract_json_text(generated_text)
+            predictions.append(json_text)
+
+    return predictions
+
+
+# ---------------------------------------------------------------------------
+# Encoder path
+# ---------------------------------------------------------------------------
+
+
+def _build_encoder_model_and_tokenizer(runtime: RuntimeConfig, device: torch.device, examples: list[SurveyExample]):
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(runtime.model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    backbone = AutoModel.from_pretrained(runtime.model_name)
+    hidden_size = int(backbone.config.hidden_size)
+
+    bootstrap_loader = make_dataloader(
+        examples,
+        tokenizer=tokenizer,
+        batch_size=min(2, len(examples)) if examples else 1,
+        model_family=ModelFamily.ENCODER,
+        shuffle=False,
+        max_seq_len=runtime.max_sequence_length,
+        include_labels=True,
+    )
+    bootstrap_batch = next(iter(bootstrap_loader))
+
+    num_overall_labels = len(SentimentLabel)
+    num_metadata_labels = len(bootstrap_batch["metadata_label_names"])
+    num_theme_labels = int(bootstrap_batch["theme_targets"].shape[1])
+    num_emotion_labels = int(bootstrap_batch["emotion_targets"].shape[1])
+
+    model = EncoderSurveyModel(
+        backbone=backbone,
+        hidden_size=hidden_size,
+        num_overall_labels=num_overall_labels,
+        num_metadata_labels=num_metadata_labels,
+        num_theme_labels=num_theme_labels,
+        num_emotion_labels=num_emotion_labels,
+    )
+    model.to(device)
+
+    metadata_label_names = list(bootstrap_batch["metadata_label_names"])
+    theme_label_names = list(bootstrap_batch["theme_label_names"])
+    emotion_label_names = list(bootstrap_batch["emotion_label_names"])
+
+    return model, tokenizer, metadata_label_names, theme_label_names, emotion_label_names
+
+
+def _encoder_train_step(
+    model: EncoderSurveyModel,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    autocast_ctx: Any,
+) -> torch.Tensor:
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    seq_len = input_ids.shape[1]
+
+    overall_targets = batch["overall_sentiment_targets"].to(device)
+    theme_targets = batch["theme_targets"].to(device)
+    emotion_targets = batch["emotion_targets"].to(device)
+    metadata_targets = _pad_token_labels(batch["metadata_token_targets"], seq_len=seq_len, device=device)
+
+    with autocast_ctx:
+        logits = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        overall_loss = F.cross_entropy(logits["overall_logits"], overall_targets)
+        theme_loss = F.binary_cross_entropy_with_logits(logits["theme_logits"], theme_targets)
+        emotion_loss = F.binary_cross_entropy_with_logits(logits["emotion_logits"], emotion_targets)
+        metadata_loss = F.cross_entropy(
+            logits["metadata_logits"].reshape(-1, logits["metadata_logits"].shape[-1]),
+            metadata_targets.reshape(-1),
+            ignore_index=-100,
+        )
+
+        loss = overall_loss + 0.5 * metadata_loss + 0.25 * theme_loss + 0.25 * emotion_loss
+
+    loss.backward()
+    return loss.detach()
+
+
+def _encoder_predict(
+    model: EncoderSurveyModel,
+    tokenizer: Any,
+    examples: list[SurveyExample],
+    runtime: RuntimeConfig,
+    device: torch.device,
+    metadata_label_names: list[str],
+    theme_label_names: list[str],
+    emotion_label_names: list[str],
+) -> list[Mapping[str, Any] | str]:
+    sentiment_labels = [label.value for label in SentimentLabel]
+    model.eval()
+    predictions: list[Mapping[str, Any] | str] = []
+
+    eval_loader = make_dataloader(
+        examples,
+        tokenizer=tokenizer,
+        batch_size=EVAL_BATCH_SIZE,
+        model_family=ModelFamily.ENCODER,
+        shuffle=False,
+        max_seq_len=runtime.max_sequence_length,
+        include_labels=True,
+    )
+
+    with torch.no_grad():
+        for batch in eval_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+            overall_prob = torch.softmax(outputs["overall_logits"], dim=-1)
+            overall_idx = overall_prob.argmax(dim=-1)
+            theme_prob = torch.sigmoid(outputs["theme_logits"])
+            emotion_prob = torch.sigmoid(outputs["emotion_logits"])
+            metadata_idx = outputs["metadata_logits"].argmax(dim=-1)
+
+            offset_mapping = batch["offset_mapping"].tolist()
+            for row_index, example in enumerate(batch["examples"]):
+                sentiment_label = sentiment_labels[int(overall_idx[row_index].item())]
+                sentiment_score = float(overall_prob[row_index].max().item())
+
+                metadata = _decode_token_entities(
+                    raw_text=example.raw_text,
+                    offsets=offset_mapping[row_index],
+                    label_ids=metadata_idx[row_index].tolist(),
+                    label_names=metadata_label_names,
+                    sentiment_label=sentiment_label,
+                    sentiment_score=sentiment_score,
+                )
+                themes = _themes_payload(
+                    raw_text=example.raw_text,
+                    sentiment_label=sentiment_label,
+                    sentiment_score=sentiment_score,
+                    theme_labels=theme_label_names,
+                    theme_probs=theme_prob[row_index],
+                    emotion_labels=emotion_label_names,
+                    emotion_probs=emotion_prob[row_index],
+                )
+                predictions.append(
+                    _prediction_template(
+                        example,
+                        overall_label=sentiment_label,
+                        overall_score=sentiment_score,
+                        metadata=metadata,
+                        themes=themes,
+                    )
+                )
+
+    return predictions
+
+
+# ---------------------------------------------------------------------------
+# Main training + evaluation flow
+# ---------------------------------------------------------------------------
+
+
+def _training_loop(
+    model: Any,
+    optimizer: torch.optim.Optimizer,
+    train_loader: Any,
+    train_step_fn: Any,
+    device: torch.device,
+) -> TrainState:
+    autocast_ctx = _autocast_context(device)
+    state = TrainState()
+    loader_iter = iter(train_loader)
+
+    while True:
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            batch = next(loader_iter)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss = train_step_fn(model=model, batch=batch, device=device, autocast_ctx=autocast_ctx)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+        optimizer.step()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+
+        state.step += 1
+        if state.step > TIME_BUDGET_WARMUP_STEPS:
+            state.steady_training_seconds += dt
+        state.running_loss = 0.95 * state.running_loss + 0.05 * float(loss.item())
+
+        progress = min(1.0, state.steady_training_seconds / float(TIME_BUDGET))
+        if state.step % LOG_EVERY_STEPS == 0:
+            print(
+                f"step {state.step:05d} | progress {progress * 100:5.1f}% | "
+                f"loss {state.running_loss:.6f} | elapsed {state.steady_training_seconds:.1f}s"
+            )
+
+        if state.step > TIME_BUDGET_WARMUP_STEPS and state.steady_training_seconds >= TIME_BUDGET:
+            break
+
+    return state
+
+
+def main() -> None:
+    run_start = time.time()
+    _set_seed(RANDOM_SEED)
+
+    device = _device()
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.cuda.reset_peak_memory_stats(device)
+
+    selected = _resolve_selected_model()
+    runtime = _runtime_config(selected)
+
+    print("selected_model:", runtime.model_name)
+    print("selected_family:", runtime.model_family)
+    print("selected_registry_id:", runtime.model_registry_id)
+    print("selected_config:", json.dumps(asdict(runtime), sort_keys=True))
+    print("time_budget_seconds:", TIME_BUDGET)
+
+    splits = load_dataset_splits()
+    if not splits.train:
+        raise ValueError("No training examples found in dataset split.")
+    if not splits.val:
+        raise ValueError("No validation examples found in dataset split.")
+
+    if runtime.model_family == ModelFamily.DECODER.value:
+        model, tokenizer = _build_decoder_model_and_tokenizer(runtime, device)
+
+        train_loader = make_dataloader(
+            splits.train,
+            tokenizer=tokenizer,
+            batch_size=runtime.batch_size,
+            model_family=ModelFamily.DECODER,
+            shuffle=True,
+            max_seq_len=runtime.max_sequence_length,
+            include_labels=True,
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=runtime.learning_rate,
+            weight_decay=WEIGHT_DECAY,
+        )
+
+        train_state = _training_loop(
+            model=model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            train_step_fn=_decoder_train_step,
+            device=device,
+        )
+
+        predictions = _decoder_predict(
+            model=model,
+            tokenizer=tokenizer,
+            examples=splits.val,
+            runtime=runtime,
+            device=device,
+        )
+
+    elif runtime.model_family == ModelFamily.ENCODER.value:
+        model, tokenizer, metadata_label_names, theme_label_names, emotion_label_names = _build_encoder_model_and_tokenizer(
+            runtime,
+            device,
+            splits.train,
+        )
+
+        train_loader = make_dataloader(
+            splits.train,
+            tokenizer=tokenizer,
+            batch_size=runtime.batch_size,
+            model_family=ModelFamily.ENCODER,
+            shuffle=True,
+            max_seq_len=runtime.max_sequence_length,
+            include_labels=True,
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=runtime.learning_rate,
+            weight_decay=WEIGHT_DECAY,
+        )
+
+        train_state = _training_loop(
+            model=model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            train_step_fn=_encoder_train_step,
+            device=device,
+        )
+
+        predictions = _encoder_predict(
+            model=model,
+            tokenizer=tokenizer,
+            examples=splits.val,
+            runtime=runtime,
+            device=device,
+            metadata_label_names=metadata_label_names,
+            theme_label_names=theme_label_names,
+            emotion_label_names=emotion_label_names,
+        )
+
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        raise ValueError(f"Unsupported model family: {runtime.model_family}")
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    metrics = score_predictions(splits.val, predictions)
+    val_metric = compute_validation_score(metrics)
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    total_seconds = time.time() - run_start
+    peak_vram_mb = float(torch.cuda.max_memory_allocated() / 1024 / 1024) if device.type == "cuda" else 0.0
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    summary = {
+        "val_metric": float(val_metric),
+        "json_schema_compliance": float(metrics.get("json_schema_compliance", 0.0)),
+        "training_seconds": float(train_state.steady_training_seconds),
+        "total_seconds": float(total_seconds),
+        "peak_vram_mb": float(peak_vram_mb),
+        "model_name": runtime.model_name,
+        "model_family": runtime.model_family,
+        "model_registry_id": runtime.model_registry_id,
+        "run_tag": runtime.run_tag,
+        "num_steps": int(train_state.step),
+        "avg_train_loss": float(train_state.running_loss),
+        "config_json": json.dumps(asdict(runtime), sort_keys=True),
+    }
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+    _summary_print(summary)
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
-
-    train_loss_f = train_loss.item()
-
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 10:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
-
-    step += 1
-
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
-
-print()  # newline after \r training log
-
-total_tokens = step * TOTAL_BATCH_SIZE
-
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+if __name__ == "__main__":
+    main()
