@@ -38,6 +38,7 @@ from prepare import (
     compute_validation_score,
     load_dataset_splits,
     make_dataloader,
+    resolve_dataset_path,
     score_predictions,
 )
 
@@ -51,6 +52,7 @@ SELECTION_STRATEGY = SelectionStrategy.ROUND_ROBIN
 MODEL_REGISTRY_ID: str | None = None
 RUN_TAG = "phase3"
 RANDOM_SEED = 17
+DATASET_CSV_PATH: str | None = None
 
 TRAIN_BATCH_SIZE_OVERRIDE: int | None = None
 LEARNING_RATE_OVERRIDE: float | None = None
@@ -700,7 +702,9 @@ def main() -> None:
     print("selected_config:", json.dumps(asdict(runtime), sort_keys=True))
     print("time_budget_seconds:", TIME_BUDGET)
 
-    splits = load_dataset_splits()
+    dataset_path = resolve_dataset_path(DATASET_CSV_PATH)
+    print("dataset_csv_path:", str(dataset_path))
+    splits = load_dataset_splits(str(dataset_path))
     if not splits.train:
         raise ValueError("No training examples found in dataset split.")
     if not splits.val:

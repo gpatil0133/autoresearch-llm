@@ -226,8 +226,10 @@ def resolve_dataset_path(csv_path: str | Path | None = None) -> Path:
         raise FileNotFoundError(
             f"No dataset CSV found. Expected {DEFAULT_DATASET_PATH} or a single CSV under {DATA_DIR}."
         )
+    candidate_names = ", ".join(path.name for path in candidates)
     raise FileNotFoundError(
-        f"Multiple CSV files found under {DATA_DIR}; pass --csv-path explicitly."
+        f"Multiple CSV files found under {DATA_DIR}; pass --csv-path explicitly. "
+        f"Available files: {candidate_names}"
     )
 
 

@@ -20,9 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from prepare import ROOT_DIR
+from prepare import ModelFamily, SurveyExample, load_dataset_splits, resolve_dataset_path, score_predictions
 
 
+ROOT_DIR = Path(__file__).resolve().parent
 RESULTS_PATH = ROOT_DIR / "results.tsv"
 LEADERBOARD_PATH = ROOT_DIR / "leaderboard.json"
 
@@ -45,6 +46,17 @@ RESULTS_COLUMNS = (
 )
 
 TOP_K_LEADERBOARD = 20
+DEFAULT_METRIC_KEYS = (
+	"overall_sentiment_macro_f1",
+	"sentence_sentiment_macro_f1",
+	"sentence_sentiment_accuracy",
+	"metadata_span_f1",
+	"metadata_typed_f1",
+	"theme_f1",
+	"emotion_f1",
+	"json_schema_compliance",
+	"val_metric",
+)
 
 
 @dataclass(frozen=True)
@@ -296,6 +308,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 	board_parser = subparsers.add_parser("leaderboard", help="Regenerate leaderboard.json")
 	board_parser.add_argument("--top-k", type=int, default=TOP_K_LEADERBOARD)
 
+	score_parser = subparsers.add_parser(
+		"score",
+		help="Evaluate predictions JSONL on a split, log metrics, and refresh leaderboard",
+	)
+	score_parser.add_argument("--predictions-path", type=Path, required=True)
+	score_parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+	score_parser.add_argument("--csv-path", type=str, default=None)
+	score_parser.add_argument("--experiment-id", type=str, required=True)
+	score_parser.add_argument("--model-registry-id", type=str, required=True)
+	score_parser.add_argument("--hf-model-name", type=str, required=True)
+	score_parser.add_argument(
+		"--model-family",
+		choices=[item.value for item in ModelFamily],
+		required=True,
+	)
+	score_parser.add_argument("--selection-strategy", type=str, default="round_robin")
+	score_parser.add_argument("--run-tag", type=str, default="default")
+	score_parser.add_argument("--status", type=str, default="completed")
+	score_parser.add_argument("--checkpoint-path", type=str, default="")
+	score_parser.add_argument("--notes", type=str, default="")
+
 	subparsers.add_parser("summary", help="Print concise summary")
 	return parser
 
@@ -303,6 +336,126 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def _load_json_file(path: Path) -> Any:
 	with path.open("r", encoding="utf-8") as handle:
 		return json.load(handle)
+
+
+def _load_predictions_jsonl(path: Path) -> list[dict[str, Any]]:
+	rows: list[dict[str, Any]] = []
+	with path.open("r", encoding="utf-8") as handle:
+		for line_number, line in enumerate(handle, start=1):
+			text = line.strip()
+			if not text:
+				continue
+			try:
+				payload = json.loads(text)
+			except json.JSONDecodeError as exc:
+				rows.append(
+					{
+						"example_id": None,
+						"prediction": {},
+						"is_valid_json": False,
+						"validation_error": f"jsonl_parse_error@line_{line_number}: {exc}",
+					}
+				)
+				continue
+
+			if isinstance(payload, dict):
+				rows.append(payload)
+			else:
+				rows.append(
+					{
+						"example_id": None,
+						"prediction": {},
+						"is_valid_json": False,
+						"validation_error": f"jsonl_row_not_object@line_{line_number}",
+					}
+				)
+	return rows
+
+
+def _examples_for_split(split_name: str, csv_path: str | None) -> list[SurveyExample]:
+	splits = load_dataset_splits(csv_path)
+	if split_name == "train":
+		return list(splits.train)
+	if split_name == "val":
+		return list(splits.val)
+	if split_name == "test":
+		return list(splits.test)
+	raise ValueError(f"Unsupported split: {split_name}")
+
+
+def _align_predictions_to_references(
+	references: Sequence[SurveyExample],
+	prediction_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any] | str], dict[str, Any]]:
+	by_example_id: dict[str, Mapping[str, Any]] = {}
+	duplicate_ids = 0
+	invalid_records = 0
+	unkeyed_records = 0
+
+	for row in prediction_rows:
+		example_id_raw = row.get("example_id")
+		example_id = str(example_id_raw).strip() if example_id_raw is not None else ""
+		if not example_id:
+			unkeyed_records += 1
+			continue
+		if example_id in by_example_id:
+			duplicate_ids += 1
+		by_example_id[example_id] = row
+
+	aligned: list[Mapping[str, Any] | str] = []
+	missing_predictions = 0
+	for example in references:
+		row = by_example_id.get(example.example_id)
+		if row is None:
+			missing_predictions += 1
+			invalid_records += 1
+			aligned.append("<missing-prediction>")
+			continue
+
+		prediction = row.get("prediction", row)
+		if prediction is None:
+			invalid_records += 1
+			aligned.append("<invalid-prediction>")
+			continue
+
+		is_valid_json = row.get("is_valid_json")
+		if is_valid_json is False:
+			invalid_records += 1
+			aligned.append("<invalid-prediction>")
+			continue
+
+		aligned.append(prediction)
+
+	stats = {
+		"prediction_rows": len(prediction_rows),
+		"matched_examples": len(references) - missing_predictions,
+		"missing_predictions": missing_predictions,
+		"invalid_predictions": invalid_records,
+		"duplicate_prediction_ids": duplicate_ids,
+		"unkeyed_prediction_rows": unkeyed_records,
+	}
+	return aligned, stats
+
+
+def evaluate_predictions(
+	*,
+	predictions_path: Path,
+	split: str,
+	csv_path: str | None = None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+	prediction_rows = _load_predictions_jsonl(predictions_path)
+	resolved_csv_path = str(resolve_dataset_path(csv_path))
+	references = _examples_for_split(split, resolved_csv_path)
+	if not references:
+		raise ValueError(f"No examples available for split={split!r}")
+
+	aligned_predictions, alignment_stats = _align_predictions_to_references(
+		references,
+		prediction_rows,
+	)
+	alignment_stats["resolved_csv_path"] = resolved_csv_path
+	metrics = score_predictions(references, aligned_predictions)
+	return metrics, alignment_stats
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -334,6 +487,56 @@ def main(argv: Sequence[str] | None = None) -> None:
 			top_k=args.top_k,
 		)
 		print(f"leaderboard_total: {leaderboard['total_experiments']}")
+		print(f"leaderboard_path: {args.leaderboard_path}")
+		return
+
+	if args.command == "score":
+		metrics, alignment_stats = evaluate_predictions(
+			predictions_path=args.predictions_path,
+			split=args.split,
+			csv_path=args.csv_path,
+		)
+
+		record = ExperimentRecord(
+			experiment_id=args.experiment_id,
+			model_registry_id=args.model_registry_id,
+			hf_model_name=args.hf_model_name,
+			model_family=args.model_family,
+			val_metric=float(metrics.get("val_metric", 0.0)),
+			json_schema_compliance=float(metrics.get("json_schema_compliance", 0.0)),
+			status=args.status,
+			run_tag=args.run_tag,
+			selection_strategy=args.selection_strategy,
+			checkpoint_path=args.checkpoint_path,
+			predictions_path=str(args.predictions_path),
+			metrics=dict(metrics),
+			config={
+				"split": args.split,
+				"csv_path": args.csv_path or "",
+				"predictions_path": str(args.predictions_path),
+				"alignment_stats": alignment_stats,
+			},
+			notes=args.notes,
+		)
+
+		leaderboard = append_result(
+			record,
+			results_path=args.results_path,
+			leaderboard_path=args.leaderboard_path,
+		)
+
+		for key in DEFAULT_METRIC_KEYS:
+			if key in metrics:
+				print(f"{key}: {float(metrics[key]):.6f}")
+		print(f"prediction_rows: {alignment_stats['prediction_rows']}")
+		print(f"matched_examples: {alignment_stats['matched_examples']}")
+		print(f"missing_predictions: {alignment_stats['missing_predictions']}")
+		print(f"invalid_predictions: {alignment_stats['invalid_predictions']}")
+		print(f"duplicate_prediction_ids: {alignment_stats['duplicate_prediction_ids']}")
+		print(f"unkeyed_prediction_rows: {alignment_stats['unkeyed_prediction_rows']}")
+		print(f"appended_experiment: {args.experiment_id}")
+		print(f"leaderboard_total: {leaderboard['total_experiments']}")
+		print(f"results_path: {args.results_path}")
 		print(f"leaderboard_path: {args.leaderboard_path}")
 		return
 
