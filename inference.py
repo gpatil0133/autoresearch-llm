@@ -25,6 +25,7 @@ from prepare import (
 	ModelFamily,
 	SentimentLabel,
 	SurveyExample,
+	TextAnalysisEnvelope,
 	load_dataset_splits,
 	make_dataloader,
 	validate_text_analysis_payload,
@@ -38,6 +39,7 @@ DEFAULT_BATCH_SIZE = 4
 DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_MULTILABEL_THRESHOLD = 0.5
 DEFAULT_RETRY_ATTEMPTS = 2
+DEFAULT_DECODER_JSON_DECODING = "constrained"
 
 
 class EncoderSurveyModel(nn.Module):
@@ -281,6 +283,82 @@ def _decoder_prompt(raw_text: str) -> str:
 	return f"{DECODER_PROMPT_TEMPLATE.format(raw_text=raw_text)}\n{instructions}\n"
 
 
+def _build_outlines_json_generator(model: Any, tokenizer: Any, max_new_tokens: int):
+	try:
+		import outlines
+	except ImportError:
+		return None, "outlines package is not installed"
+
+	try:
+		model_wrapper = outlines.models.from_transformers(model, tokenizer)
+	except Exception as exc:
+		return None, f"failed to initialize outlines constrained decoder: {exc}"
+
+	def _run(prompt: str) -> tuple[dict[str, Any], str]:
+		result = model_wrapper(
+			prompt,
+			TextAnalysisEnvelope,
+			max_new_tokens=max_new_tokens,
+			do_sample=False,
+		)
+		if isinstance(result, TextAnalysisEnvelope):
+			payload = result.model_dump(mode="json")
+			return payload, json.dumps(payload, ensure_ascii=False)
+
+		if isinstance(result, Mapping):
+			payload = dict(result)
+			return payload, json.dumps(payload, ensure_ascii=False)
+
+		if hasattr(result, "model_dump"):
+			payload = result.model_dump(mode="json")
+			return payload, json.dumps(payload, ensure_ascii=False)
+
+		if isinstance(result, str):
+			json_text = _extract_json_text(result)
+			payload = json.loads(json_text)
+			return payload, result
+
+		raise TypeError(f"Unsupported constrained decode output type: {type(result)!r}")
+
+	return _run, None
+
+
+def _legacy_decoder_json_candidate(
+	*,
+	model: Any,
+	tokenizer: Any,
+	device: torch.device,
+	prompt: str,
+	max_seq_len: int,
+	max_new_tokens: int,
+) -> tuple[dict[str, Any], str]:
+	tokenized = tokenizer(
+		[prompt],
+		return_tensors="pt",
+		padding=True,
+		truncation=True,
+		max_length=max_seq_len,
+	).to(device)
+
+	with torch.no_grad():
+		generated = model.generate(
+			**tokenized,
+			max_new_tokens=max_new_tokens,
+			temperature=0.0,
+			top_p=1.0,
+			do_sample=False,
+			pad_token_id=tokenizer.pad_token_id,
+			eos_token_id=tokenizer.eos_token_id,
+		)
+
+	prompt_len = int(tokenized["attention_mask"][0].sum().item())
+	generated_ids = generated[0][prompt_len:]
+	raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+	candidate_json_text = _extract_json_text(raw_output)
+	candidate_payload = json.loads(candidate_json_text)
+	return candidate_payload, raw_output
+
+
 def _decode_token_entities(
 	raw_text: str,
 	offsets: Iterable[Iterable[int]],
@@ -404,6 +482,7 @@ def _decoder_predictions(
 	max_seq_len: int,
 	max_new_tokens: int,
 	retry_attempts: int,
+	decoder_json_decoding: str,
 ) -> tuple[list[dict[str, Any]], str]:
 	device = _device()
 	model, tokenizer, resolved_model_name = _build_decoder_model(
@@ -411,6 +490,17 @@ def _decoder_predictions(
 		checkpoint_path=checkpoint_path,
 		device=device,
 	)
+
+	constrained_runner = None
+	constrained_error: str | None = None
+	if decoder_json_decoding == "constrained":
+		constrained_runner, constrained_error = _build_outlines_json_generator(
+			model=model,
+			tokenizer=tokenizer,
+			max_new_tokens=max_new_tokens,
+		)
+		if constrained_runner is None:
+			print(f"[warn] constrained decoder unavailable; falling back to legacy mode: {constrained_error}")
 
 	records: list[dict[str, Any]] = []
 
@@ -421,32 +511,19 @@ def _decoder_predictions(
 		validation_error: str | None = None
 
 		for _ in range(max(1, retry_attempts)):
-			tokenized = tokenizer(
-				[prompt],
-				return_tensors="pt",
-				padding=True,
-				truncation=True,
-				max_length=max_seq_len,
-			).to(device)
-
-			with torch.no_grad():
-				generated = model.generate(
-					**tokenized,
-					max_new_tokens=max_new_tokens,
-					temperature=0.0,
-					top_p=1.0,
-					do_sample=False,
-					pad_token_id=tokenizer.pad_token_id,
-					eos_token_id=tokenizer.eos_token_id,
-				)
-
-			prompt_len = int(tokenized["attention_mask"][0].sum().item())
-			generated_ids = generated[0][prompt_len:]
-			raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
-			candidate_json_text = _extract_json_text(raw_output)
-
 			try:
-				candidate_payload = json.loads(candidate_json_text)
+				if decoder_json_decoding == "constrained" and constrained_runner is not None:
+					candidate_payload, raw_output = constrained_runner(prompt)
+				else:
+					candidate_payload, raw_output = _legacy_decoder_json_candidate(
+						model=model,
+						tokenizer=tokenizer,
+						device=device,
+						prompt=prompt,
+						max_seq_len=max_seq_len,
+						max_new_tokens=max_new_tokens,
+					)
+
 				parsed = validate_text_analysis_payload(candidate_payload)
 				payload = _build_prediction_payload(
 					example,
@@ -707,6 +784,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
 	parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
 	parser.add_argument("--retry-attempts", type=int, default=DEFAULT_RETRY_ATTEMPTS)
+	parser.add_argument(
+		"--decoder-json-decoding",
+		choices=["constrained", "legacy"],
+		default=DEFAULT_DECODER_JSON_DECODING,
+		help="Decoder JSON strategy: constrained schema decoding or legacy free-form decode+parse",
+	)
 	parser.add_argument("--multilabel-threshold", type=float, default=DEFAULT_MULTILABEL_THRESHOLD)
 	return parser
 
@@ -727,6 +810,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 			max_seq_len=min(args.max_seq_len, MAX_SEQ_LEN),
 			max_new_tokens=args.max_new_tokens,
 			retry_attempts=args.retry_attempts,
+			decoder_json_decoding=args.decoder_json_decoding,
 		)
 	elif family == ModelFamily.ENCODER:
 		records, resolved_model_name = _encoder_predictions(
