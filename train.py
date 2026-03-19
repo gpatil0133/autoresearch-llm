@@ -68,6 +68,11 @@ WARMUP_STEPS = 5
 TIME_BUDGET_WARMUP_STEPS = 1
 LOG_EVERY_STEPS = 1
 
+DECODER_EARLY_STOP_ENABLED = True
+DECODER_EARLY_STOP_PATIENCE = 20
+DECODER_EARLY_STOP_MIN_DELTA = 5e-4
+DECODER_EARLY_STOP_MIN_STEPS = 20
+
 EVAL_BATCH_SIZE = 4
 DECODER_MAX_NEW_TOKENS = 512
 DECODER_GENERATION_TEMPERATURE = 0.0
@@ -99,6 +104,10 @@ class TrainState:
     step: int = 0
     steady_training_seconds: float = 0.0
     running_loss: float = 0.0
+    best_monitored_loss: float = float("inf")
+    plateau_steps: int = 0
+    stopped_early: bool = False
+    stop_reason: str = ""
 
 
 class EncoderSurveyModel(nn.Module):
@@ -400,6 +409,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE_OVERRIDE)
     parser.add_argument("--max-seq-len", type=int, default=MAX_SEQUENCE_LENGTH_OVERRIDE)
     parser.add_argument("--use-lora", choices=["true", "false"], default=None)
+    parser.add_argument(
+        "--decoder-early-stop-enabled",
+        choices=["true", "false"],
+        default="true" if DECODER_EARLY_STOP_ENABLED else "false",
+    )
+    parser.add_argument("--decoder-early-stop-patience", type=int, default=DECODER_EARLY_STOP_PATIENCE)
+    parser.add_argument("--decoder-early-stop-min-delta", type=float, default=DECODER_EARLY_STOP_MIN_DELTA)
+    parser.add_argument("--decoder-early-stop-min-steps", type=int, default=DECODER_EARLY_STOP_MIN_STEPS)
     parser.add_argument("--summary-path", type=Path, default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     return parser
@@ -416,6 +433,10 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
     global LEARNING_RATE_OVERRIDE
     global MAX_SEQUENCE_LENGTH_OVERRIDE
     global USE_LORA_OVERRIDE
+    global DECODER_EARLY_STOP_ENABLED
+    global DECODER_EARLY_STOP_PATIENCE
+    global DECODER_EARLY_STOP_MIN_DELTA
+    global DECODER_EARLY_STOP_MIN_STEPS
     global SUMMARY_PATH
     global CHECKPOINT_DIR
 
@@ -430,6 +451,10 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
     MAX_SEQUENCE_LENGTH_OVERRIDE = args.max_seq_len
     if args.use_lora is not None:
         USE_LORA_OVERRIDE = args.use_lora.lower() == "true"
+    DECODER_EARLY_STOP_ENABLED = str(args.decoder_early_stop_enabled).lower() == "true"
+    DECODER_EARLY_STOP_PATIENCE = max(1, int(args.decoder_early_stop_patience))
+    DECODER_EARLY_STOP_MIN_DELTA = max(0.0, float(args.decoder_early_stop_min_delta))
+    DECODER_EARLY_STOP_MIN_STEPS = max(1, int(args.decoder_early_stop_min_steps))
     SUMMARY_PATH = str(args.summary_path) if args.summary_path else None
     CHECKPOINT_DIR = str(args.checkpoint_dir) if args.checkpoint_dir else None
 
@@ -737,6 +762,10 @@ def _training_loop(
     train_loader: Any,
     train_step_fn: Any,
     device: torch.device,
+    monitor_plateau: bool = False,
+    plateau_patience: int = 20,
+    plateau_min_delta: float = 5e-4,
+    plateau_min_steps: int = 20,
 ) -> TrainState:
     autocast_ctx = _autocast_context(device)
     state = TrainState()
@@ -767,12 +796,32 @@ def _training_loop(
             state.steady_training_seconds += dt
         state.running_loss = 0.95 * state.running_loss + 0.05 * float(loss.item())
 
+        if monitor_plateau:
+            monitored_loss = float(state.running_loss)
+            improved = (state.best_monitored_loss - monitored_loss) >= plateau_min_delta
+            if improved:
+                state.best_monitored_loss = monitored_loss
+                state.plateau_steps = 0
+            else:
+                state.plateau_steps += 1
+
         progress = min(1.0, state.steady_training_seconds / float(TIME_BUDGET))
         if state.step % LOG_EVERY_STEPS == 0:
             print(
                 f"step {state.step:05d} | progress {progress * 100:5.1f}% | "
                 f"loss {state.running_loss:.6f} | elapsed {state.steady_training_seconds:.1f}s"
             )
+
+        if monitor_plateau and state.step >= plateau_min_steps and state.plateau_steps >= plateau_patience:
+            state.stopped_early = True
+            state.stop_reason = (
+                "decoder_plateau "
+                f"(no_improve_steps={state.plateau_steps}, "
+                f"best_loss={state.best_monitored_loss:.6f}, "
+                f"current_loss={state.running_loss:.6f})"
+            )
+            print(f"early_stop: {state.stop_reason}")
+            break
 
         if state.step > TIME_BUDGET_WARMUP_STEPS and state.steady_training_seconds >= TIME_BUDGET:
             break
@@ -833,6 +882,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             train_loader=train_loader,
             train_step_fn=_decoder_train_step,
             device=device,
+            monitor_plateau=DECODER_EARLY_STOP_ENABLED,
+            plateau_patience=DECODER_EARLY_STOP_PATIENCE,
+            plateau_min_delta=DECODER_EARLY_STOP_MIN_DELTA,
+            plateau_min_steps=DECODER_EARLY_STOP_MIN_STEPS,
         )
 
         predictions = _decoder_predict(
@@ -918,6 +971,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "run_tag": runtime.run_tag,
         "num_steps": int(train_state.step),
         "avg_train_loss": float(train_state.running_loss),
+        "stopped_early": bool(train_state.stopped_early),
+        "stop_reason": train_state.stop_reason,
         "config_json": json.dumps(asdict(runtime), sort_keys=True),
         "checkpoint_path": checkpoint_path,
     }

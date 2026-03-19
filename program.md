@@ -113,3 +113,8 @@ If two approaches achieve similar `val_metric`, keep the simpler one (fewer movi
 - Phase 3: complete
 - Phase 4: complete
 - Next: phase 5 task-level evaluation integration and loop orchestration
+
+### Supported Models
+- Qwen
+- Llama
+- Mistral (7B, 3B)

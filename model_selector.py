@@ -88,6 +88,50 @@ DEFAULT_MODEL_REGISTRY: tuple[ModelSpec, ...] = (
 		},
 	),
 	ModelSpec(
+		registry_id="decoder_qwen25_3b_instruct",
+		hf_model_name="Qwen/Qwen2.5-3B-Instruct",
+		family=ModelFamily.DECODER,
+		description="Qwen2.5 3B instruct decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 1,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="decoder_qwen3_1_7b",
+		hf_model_name="Qwen/Qwen3-1.7B",
+		family=ModelFamily.DECODER,
+		description="Qwen3 1.7B decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 2,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="decoder_qwen25_1_5b_instruct",
+		hf_model_name="Qwen/Qwen2.5-1.5B-Instruct",
+		family=ModelFamily.DECODER,
+		description="Qwen2.5 1.5B instruct decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 2,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="decoder_llama32_3b_instruct",
+		hf_model_name="meta-llama/Llama-3.2-3B-Instruct",
+		family=ModelFamily.DECODER,
+		description="Llama 3.2 3B instruct decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 1,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
 		registry_id="encoder_modernbert_base",
 		hf_model_name="answerdotai/ModernBERT-base",
 		family=ModelFamily.ENCODER,
@@ -96,6 +140,28 @@ DEFAULT_MODEL_REGISTRY: tuple[ModelSpec, ...] = (
 			"learning_rate": 2.5e-5,
 			"batch_size": 12,
 			"max_sequence_length": min(512, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="decoder_mistral_7b",
+		hf_model_name="mistral-7b",
+		family=ModelFamily.DECODER,
+		description="Mistral 7B decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 2,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="decoder_mistral_3b",
+		hf_model_name="mistral-3b",
+		family=ModelFamily.DECODER,
+		description="Mistral 3B decoder baseline.",
+		overrides={
+			"learning_rate": 1.5e-5,
+			"batch_size": 2,
+			"max_sequence_length": min(1024, MAX_SEQ_LEN),
 		},
 	),
 )

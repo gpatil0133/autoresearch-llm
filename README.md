@@ -89,6 +89,11 @@ uv run run_experiments.py --num-experiments 2 --run-tag phase6 --split val
 - Larger models increase startup, training step time, and especially decoder inference latency.
 - The fixed 5-minute optimization budget is measured during the training step loop, so model loading time does not consume `training_seconds`.
 
+## Mistral models
+
+- **Mistral-7B**: Decoder model with LoRA rank 32 and alpha 64.
+- **Mistral-3B**: Decoder model with LoRA rank 16 and alpha 32.
+
 ## License
 
 MIT
