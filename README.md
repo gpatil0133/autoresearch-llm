@@ -69,6 +69,9 @@ uv run inference.py --model-family encoder --model-name distilbert-base-uncased 
 # 5) Initialize / inspect benchmark tracking
 uv run eval.py init
 uv run eval.py summary
+
+# 6) Run autonomous phase-6 loop (example: two short encoder/decoder cycles)
+uv run run_experiments.py --num-experiments 2 --run-tag phase6 --split val
 ```
 
 ## Phase status
@@ -77,7 +80,8 @@ uv run eval.py summary
 - Phase 2: complete (model selection + benchmark tracker scaffolding).
 - Phase 3: complete (fixed-budget fine-tuning in `train.py`).
 - Phase 4: complete (structured inference in `inference.py`).
-- Phase 5+: in progress (task-level eval integration + orchestration loop).
+- Phase 5: complete (task-level evaluation + schema compliance logging in `eval.py`).
+- Phase 6: complete (`run_experiments.py` orchestrates select -> train -> inference -> eval/log with non-destructive keep/discard states).
 
 ## Notes for model choice
 

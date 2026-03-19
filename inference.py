@@ -40,6 +40,10 @@ DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_MULTILABEL_THRESHOLD = 0.5
 DEFAULT_RETRY_ATTEMPTS = 2
 DEFAULT_DECODER_JSON_DECODING = "constrained"
+DEFAULT_METADATA_TOKEN_CONFIDENCE = 0.80
+DEFAULT_METADATA_MIN_CHARS = 3
+DEFAULT_MAX_METADATA_ENTITIES = 10
+DEFAULT_MAX_METADATA_TOTAL_CHARS = 256
 
 
 class EncoderSurveyModel(nn.Module):
@@ -363,34 +367,57 @@ def _decode_token_entities(
 	raw_text: str,
 	offsets: Iterable[Iterable[int]],
 	label_ids: Iterable[int],
+	label_confidences: Iterable[float],
 	label_names: Sequence[str],
 	sentiment_label: str,
 	sentiment_score: float,
+	*,
+	token_confidence_threshold: float = DEFAULT_METADATA_TOKEN_CONFIDENCE,
+	min_metadata_chars: int = DEFAULT_METADATA_MIN_CHARS,
+	max_metadata_entities: int = DEFAULT_MAX_METADATA_ENTITIES,
+	max_metadata_total_chars: int = DEFAULT_MAX_METADATA_TOTAL_CHARS,
 ) -> list[dict[str, Any]]:
 	entities: list[dict[str, Any]] = []
 	current_type: str | None = None
 	current_start: int | None = None
 	current_end: int | None = None
+	current_confidence_sum = 0.0
+	current_confidence_count = 0
+
+	def _is_valid_metadata_text(text: str) -> bool:
+		cleaned = text.strip()
+		if len(cleaned) < max(1, int(min_metadata_chars)):
+			return False
+		if not any(char.isalnum() for char in cleaned):
+			return False
+		if cleaned.isdigit():
+			return False
+		return True
 
 	def flush() -> None:
 		nonlocal current_type, current_start, current_end
+		nonlocal current_confidence_sum, current_confidence_count
 		if current_type is None or current_start is None or current_end is None:
 			return
 		text = raw_text[current_start:current_end].strip()
-		if text:
+		if _is_valid_metadata_text(text):
+			mean_confidence = current_confidence_sum / max(1, current_confidence_count)
 			entities.append(
 				{
 					"metadata_type": current_type,
 					"metadata_name": text,
 					"metadata_sentiment": sentiment_label,
 					"metadata_sentiment_score": _clamp_score(sentiment_score),
+					"_confidence": float(_clamp_score(mean_confidence)),
 				}
 			)
 		current_type = None
 		current_start = None
 		current_end = None
+		current_confidence_sum = 0.0
+		current_confidence_count = 0
 
-	for offset, label_id in zip(offsets, label_ids):
+	for offset, label_id, label_confidence in zip(offsets, label_ids, label_confidences):
 		if offset is None or len(offset) != 2:
 			flush()
 			continue
@@ -401,6 +428,10 @@ def _decode_token_entities(
 			continue
 
 		if label_id < 0 or label_id >= len(label_names):
+			flush()
+			continue
+
+		if float(label_confidence) < float(token_confidence_threshold):
 			flush()
 			continue
 
@@ -415,11 +446,55 @@ def _decode_token_entities(
 			current_type = entity_type
 			current_start = start_char
 			current_end = end_char
+			current_confidence_sum = float(label_confidence)
+			current_confidence_count = 1
 		else:
 			current_end = end_char
+			current_confidence_sum += float(label_confidence)
+			current_confidence_count += 1
 
 	flush()
-	return entities
+
+	best_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+	for item in entities:
+		key = (
+			str(item.get("metadata_type", "")).strip().lower(),
+			str(item.get("metadata_name", "")).strip().lower(),
+		)
+		existing = best_by_key.get(key)
+		if existing is None or float(item.get("_confidence", 0.0)) > float(existing.get("_confidence", 0.0)):
+			best_by_key[key] = item
+
+	ranked = sorted(
+		best_by_key.values(),
+		key=lambda value: (
+			float(value.get("_confidence", 0.0)),
+			len(str(value.get("metadata_name", ""))),
+		),
+		reverse=True,
+	)
+
+	pruned: list[dict[str, Any]] = []
+	total_chars = 0
+	for item in ranked:
+		if len(pruned) >= int(max(1, max_metadata_entities)):
+			break
+		name = str(item.get("metadata_name", "")).strip()
+		if not name:
+			continue
+		if total_chars + len(name) > int(max(1, max_metadata_total_chars)):
+			continue
+		total_chars += len(name)
+		pruned.append(
+			{
+				"metadata_type": str(item.get("metadata_type", "Entity")),
+				"metadata_name": name,
+				"metadata_sentiment": str(item.get("metadata_sentiment", SentimentLabel.NEUTRAL.value)),
+				"metadata_sentiment_score": float(item.get("metadata_sentiment_score", _clamp_score(sentiment_score))),
+			}
+		)
+
+	return pruned
 
 
 def _themes_payload(
@@ -645,6 +720,10 @@ def _encoder_predictions(
 	batch_size: int,
 	threshold: float,
 	bootstrap_examples: Sequence[SurveyExample],
+	metadata_token_confidence: float,
+	metadata_min_chars: int,
+	max_metadata_entities: int,
+	max_metadata_total_chars: int,
 ) -> tuple[list[dict[str, Any]], str]:
 	device = _device()
 
@@ -688,7 +767,8 @@ def _encoder_predictions(
 			overall_idx = overall_prob.argmax(dim=-1)
 			theme_prob = torch.sigmoid(outputs["theme_logits"])
 			emotion_prob = torch.sigmoid(outputs["emotion_logits"])
-			metadata_idx = outputs["metadata_logits"].argmax(dim=-1)
+			metadata_prob = torch.softmax(outputs["metadata_logits"], dim=-1)
+			metadata_confidence, metadata_idx = metadata_prob.max(dim=-1)
 			offset_mapping = batch["offset_mapping"].tolist()
 
 			for row_index, example in enumerate(batch["examples"]):
@@ -699,9 +779,14 @@ def _encoder_predictions(
 					raw_text=example.raw_text,
 					offsets=offset_mapping[row_index],
 					label_ids=metadata_idx[row_index].tolist(),
+					label_confidences=metadata_confidence[row_index].tolist(),
 					label_names=metadata_label_names,
 					sentiment_label=sentiment_label,
 					sentiment_score=sentiment_score,
+					token_confidence_threshold=metadata_token_confidence,
+					min_metadata_chars=metadata_min_chars,
+					max_metadata_entities=max_metadata_entities,
+					max_metadata_total_chars=max_metadata_total_chars,
 				)
 				themes = _themes_payload(
 					raw_text=example.raw_text,
@@ -791,6 +876,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 		help="Decoder JSON strategy: constrained schema decoding or legacy free-form decode+parse",
 	)
 	parser.add_argument("--multilabel-threshold", type=float, default=DEFAULT_MULTILABEL_THRESHOLD)
+	parser.add_argument("--metadata-token-confidence", type=float, default=DEFAULT_METADATA_TOKEN_CONFIDENCE)
+	parser.add_argument("--metadata-min-chars", type=int, default=DEFAULT_METADATA_MIN_CHARS)
+	parser.add_argument("--max-metadata-entities", type=int, default=DEFAULT_MAX_METADATA_ENTITIES)
+	parser.add_argument("--max-metadata-total-chars", type=int, default=DEFAULT_MAX_METADATA_TOTAL_CHARS)
 	return parser
 
 
@@ -821,6 +910,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 			batch_size=max(1, args.batch_size),
 			threshold=args.multilabel_threshold,
 			bootstrap_examples=bootstrap_examples,
+			metadata_token_confidence=float(max(0.0, min(1.0, args.metadata_token_confidence))),
+			metadata_min_chars=max(1, int(args.metadata_min_chars)),
+			max_metadata_entities=max(1, int(args.max_metadata_entities)),
+			max_metadata_total_chars=max(16, int(args.max_metadata_total_chars)),
 		)
 	else:
 		raise ValueError(f"Unsupported model family: {family.value}")

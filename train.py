@@ -17,9 +17,10 @@ import os
 import random
 import re
 import time
+import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -58,6 +59,8 @@ TRAIN_BATCH_SIZE_OVERRIDE: int | None = None
 LEARNING_RATE_OVERRIDE: float | None = None
 MAX_SEQUENCE_LENGTH_OVERRIDE: int | None = None
 USE_LORA_OVERRIDE: bool | None = None
+SUMMARY_PATH: str | None = None
+CHECKPOINT_DIR: str | None = None
 
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -381,6 +384,99 @@ def _summary_print(summary: Mapping[str, Any]) -> None:
             print(f"{key}: {value}")
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run fixed-budget survey training baseline")
+    parser.add_argument("--experiment-index", type=int, default=EXPERIMENT_INDEX)
+    parser.add_argument(
+        "--selection-strategy",
+        choices=[item.value for item in SelectionStrategy],
+        default=SELECTION_STRATEGY.value,
+    )
+    parser.add_argument("--model-registry-id", type=str, default=MODEL_REGISTRY_ID)
+    parser.add_argument("--run-tag", type=str, default=RUN_TAG)
+    parser.add_argument("--random-seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--csv-path", type=str, default=DATASET_CSV_PATH)
+    parser.add_argument("--train-batch-size", type=int, default=TRAIN_BATCH_SIZE_OVERRIDE)
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE_OVERRIDE)
+    parser.add_argument("--max-seq-len", type=int, default=MAX_SEQUENCE_LENGTH_OVERRIDE)
+    parser.add_argument("--use-lora", choices=["true", "false"], default=None)
+    parser.add_argument("--summary-path", type=Path, default=None)
+    parser.add_argument("--checkpoint-dir", type=Path, default=None)
+    return parser
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    global EXPERIMENT_INDEX
+    global SELECTION_STRATEGY
+    global MODEL_REGISTRY_ID
+    global RUN_TAG
+    global RANDOM_SEED
+    global DATASET_CSV_PATH
+    global TRAIN_BATCH_SIZE_OVERRIDE
+    global LEARNING_RATE_OVERRIDE
+    global MAX_SEQUENCE_LENGTH_OVERRIDE
+    global USE_LORA_OVERRIDE
+    global SUMMARY_PATH
+    global CHECKPOINT_DIR
+
+    EXPERIMENT_INDEX = int(args.experiment_index)
+    SELECTION_STRATEGY = SelectionStrategy(args.selection_strategy)
+    MODEL_REGISTRY_ID = args.model_registry_id
+    RUN_TAG = str(args.run_tag)
+    RANDOM_SEED = int(args.random_seed)
+    DATASET_CSV_PATH = args.csv_path
+    TRAIN_BATCH_SIZE_OVERRIDE = args.train_batch_size
+    LEARNING_RATE_OVERRIDE = args.learning_rate
+    MAX_SEQUENCE_LENGTH_OVERRIDE = args.max_seq_len
+    if args.use_lora is not None:
+        USE_LORA_OVERRIDE = args.use_lora.lower() == "true"
+    SUMMARY_PATH = str(args.summary_path) if args.summary_path else None
+    CHECKPOINT_DIR = str(args.checkpoint_dir) if args.checkpoint_dir else None
+
+
+def _save_training_artifacts(
+    model: Any,
+    tokenizer: Any,
+    runtime: RuntimeConfig,
+    metadata_label_names: list[str] | None = None,
+    theme_label_names: list[str] | None = None,
+    emotion_label_names: list[str] | None = None,
+) -> str:
+    if not CHECKPOINT_DIR:
+        return ""
+
+    checkpoint_dir = Path(CHECKPOINT_DIR)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if runtime.model_family == ModelFamily.DECODER.value:
+        model.save_pretrained(str(checkpoint_dir))
+        tokenizer.save_pretrained(str(checkpoint_dir))
+    else:
+        torch.save({"model_state_dict": model.state_dict()}, checkpoint_dir / "encoder_model.pt")
+        tokenizer.save_pretrained(str(checkpoint_dir / "tokenizer"))
+        label_payload = {
+            "metadata_label_names": metadata_label_names or [],
+            "theme_label_names": theme_label_names or [],
+            "emotion_label_names": emotion_label_names or [],
+        }
+        (checkpoint_dir / "encoder_label_names.json").write_text(
+            json.dumps(label_payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    return str(checkpoint_dir)
+
+
+def _write_summary_json(summary: Mapping[str, Any]) -> None:
+    if not SUMMARY_PATH:
+        return
+
+    summary_path = Path(SUMMARY_PATH)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(dict(summary), handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+
 # ---------------------------------------------------------------------------
 # Decoder path
 # ---------------------------------------------------------------------------
@@ -684,7 +780,10 @@ def _training_loop(
     return state
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
+    _apply_cli_overrides(args)
+
     run_start = time.time()
     _set_seed(RANDOM_SEED)
 
@@ -743,6 +842,11 @@ def main() -> None:
             runtime=runtime,
             device=device,
         )
+        checkpoint_path = _save_training_artifacts(
+            model=model,
+            tokenizer=tokenizer,
+            runtime=runtime,
+        )
 
     elif runtime.model_family == ModelFamily.ENCODER.value:
         model, tokenizer, metadata_label_names, theme_label_names, emotion_label_names = _build_encoder_model_and_tokenizer(
@@ -784,6 +888,14 @@ def main() -> None:
             theme_label_names=theme_label_names,
             emotion_label_names=emotion_label_names,
         )
+        checkpoint_path = _save_training_artifacts(
+            model=model,
+            tokenizer=tokenizer,
+            runtime=runtime,
+            metadata_label_names=metadata_label_names,
+            theme_label_names=theme_label_names,
+            emotion_label_names=emotion_label_names,
+        )
 
     else:
         raise ValueError(f"Unsupported model family: {runtime.model_family}")
@@ -807,8 +919,10 @@ def main() -> None:
         "num_steps": int(train_state.step),
         "avg_train_loss": float(train_state.running_loss),
         "config_json": json.dumps(asdict(runtime), sort_keys=True),
+        "checkpoint_path": checkpoint_path,
     }
 
+    _write_summary_json(summary)
     _summary_print(summary)
 
 

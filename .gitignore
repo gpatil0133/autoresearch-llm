@@ -34,3 +34,4 @@ dev/
 results.tsv
 predictions/
 leaderboard.json
+artifacts/
