@@ -21,6 +21,9 @@ from typing import Any, Mapping, Sequence
 import eval as eval_module
 from eval import ExperimentRecord
 from model_selector import SelectionStrategy, select_model
+from tasks.common.runtime import build_task_context
+from tasks.common.runtime import list_task_profile_ids
+from tasks.common.runtime import resolve_task_profile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -53,6 +56,7 @@ class OrchestratorConfig:
     state_path: str
     results_path: str
     leaderboard_path: str
+    task_profile: str
 
 
 @dataclass
@@ -126,6 +130,8 @@ def _record_state(state_path: Path, payload: Mapping[str, Any]) -> None:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run autonomous train->inference->eval experiment cycles")
+    parser.add_argument("--list-task-profiles", action="store_true")
+    parser.add_argument("--task-profile", type=str, default="nlp_analysis")
     parser.add_argument("--num-experiments", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument(
@@ -355,6 +361,17 @@ def _single_experiment(
         predictions_path=str(predictions_path),
     )
 
+    profile = resolve_task_profile(args.task_profile)
+    context = build_task_context(
+        profile_id=args.task_profile,
+        split=args.split,
+        csv_path=args.csv_path,
+        run_tag=args.run_tag,
+        experiment_id=run.experiment_id,
+        root_dir=ROOT_DIR,
+        artifact_dir=artifact_dir,
+    )
+
     if args.dry_run:
         return run
 
@@ -363,18 +380,72 @@ def _single_experiment(
             "model_name": run.model_name,
             "model_family": run.model_family,
             "model_registry_id": run.registry_id,
+            "selection_strategy": run.strategy,
             "config_json": _stable_json(selected.config),
             "checkpoint_path": "",
         }
     else:
-        train_summary = _train_experiment(run, selected.config, args)
+        train_summary = profile.train.train(
+            context=context,
+            selected_model={
+                "registry_id": run.registry_id,
+                "model_name": run.model_name,
+                "model_family": run.model_family,
+                "selection_strategy": run.strategy,
+                "config": selected.config,
+            },
+        )
         run.model_name = str(train_summary.get("model_name", run.model_name))
         run.model_family = str(train_summary.get("model_family", run.model_family))
 
-    infer_summary = _infer_experiment(run, train_summary, args)
+    infer_summary = profile.inference.infer(context=context, train_summary=train_summary)
     run.predictions_path = str(infer_summary.get("predictions_path", run.predictions_path))
 
-    val_metric, json_compliance, status, metrics, leaderboard = _evaluate_and_log(run, train_summary, args)
+    metrics, alignment_stats = profile.evaluator.evaluate(
+        context=context,
+        predictions_path=run.predictions_path,
+    )
+
+    val_metric = float(metrics.get("val_metric", 0.0))
+    json_compliance = float(metrics.get("json_schema_compliance", 0.0))
+    best_before = _read_best_metric(Path(args.leaderboard_path))
+    status = "keep" if val_metric >= best_before else "discard"
+
+    raw_config = train_summary.get("config_json", "{}")
+    try:
+        parsed_train_config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config)
+    except (TypeError, ValueError):
+        parsed_train_config = {}
+
+    leaderboard = eval_module.append_result(
+        ExperimentRecord(
+            experiment_id=run.experiment_id,
+            model_registry_id=run.registry_id,
+            hf_model_name=run.model_name,
+            model_family=run.model_family,
+            val_metric=val_metric,
+            json_schema_compliance=json_compliance,
+            status=status,
+            run_tag=run.run_tag,
+            selection_strategy=run.strategy,
+            checkpoint_path=str(train_summary.get("checkpoint_path", "")),
+            predictions_path=run.predictions_path,
+            metrics=dict(metrics),
+            config={
+                "split": args.split,
+                "csv_path": args.csv_path or "",
+                "selected_registry_id": run.registry_id,
+                "selected_model_name": run.model_name,
+                "selected_model_family": run.model_family,
+                "train_config": parsed_train_config,
+                "alignment_stats": alignment_stats,
+                "task_profile": args.task_profile,
+            },
+            notes=f"phase6_orchestrated:{status};profile={args.task_profile}",
+        ),
+        results_path=Path(args.results_path),
+        leaderboard_path=Path(args.leaderboard_path),
+    )
 
     run.val_metric = val_metric
     run.json_schema_compliance = json_compliance
@@ -391,6 +462,12 @@ def _single_experiment(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
+
+    if bool(args.list_task_profiles):
+        for profile_id in list_task_profile_ids():
+            print(profile_id)
+        return
+
     args.state_path = Path(args.state_path)
     args.results_path = Path(args.results_path)
     args.leaderboard_path = Path(args.leaderboard_path)
@@ -418,6 +495,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         state_path=str(args.state_path),
         results_path=str(args.results_path),
         leaderboard_path=str(args.leaderboard_path),
+        task_profile=args.task_profile,
     )
 
     print("---")
@@ -425,6 +503,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"num_experiments: {config.num_experiments}")
     print(f"start_index: {config.start_index}")
     print(f"selection_strategy: {config.selection_strategy}")
+    print(f"task_profile: {config.task_profile}")
     print(f"split: {config.split}")
     print(f"dry_run: {config.dry_run}")
     print(f"skip_train: {config.skip_train}")

@@ -30,6 +30,8 @@ from prepare import (
 	make_dataloader,
 	validate_text_analysis_payload,
 )
+from tasks.common.runtime import build_task_context
+from tasks.common.runtime import resolve_task_profile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -858,6 +860,7 @@ def _default_output_path(run_tag: str, split_name: str, family: ModelFamily) -> 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Run structured survey inference and export JSONL predictions")
+	parser.add_argument("--task-profile", type=str, default="nlp_analysis")
 	parser.add_argument("--model-family", choices=[item.value for item in ModelFamily], required=True)
 	parser.add_argument("--model-name", type=str, required=True)
 	parser.add_argument("--checkpoint-path", type=Path, default=None)
@@ -885,6 +888,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
 	args = _build_arg_parser().parse_args(argv)
+	_ = resolve_task_profile(args.task_profile)
+
+	if args.task_profile != "nlp_analysis":
+		profile = resolve_task_profile(args.task_profile)
+		experiment_id = f"{args.run_tag}_standalone_infer"
+		context = build_task_context(
+			profile_id=args.task_profile,
+			split=args.split,
+			csv_path=args.csv_path,
+			run_tag=args.run_tag,
+			experiment_id=experiment_id,
+			root_dir=ROOT_DIR,
+		)
+		inference_summary = profile.inference.infer(
+			context=context,
+			train_summary={
+				"model_family": args.model_family,
+				"model_name": args.model_name,
+				"checkpoint_path": str(args.checkpoint_path) if args.checkpoint_path else "",
+			},
+		)
+		print("---")
+		for key in sorted(inference_summary):
+			print(f"{key}: {inference_summary[key]}")
+		return
 
 	family = ModelFamily(args.model_family)
 	examples, bootstrap_examples = _select_split_examples(args.split, csv_path=args.csv_path)

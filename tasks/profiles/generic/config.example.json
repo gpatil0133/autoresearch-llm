@@ -1,0 +1,12 @@
+{
+  "task_kind": "classification",
+  "input_fields": ["text"],
+  "target_field": "label",
+  "label_space": ["A", "B", "C"],
+  "prediction_format": "json",
+  "metrics": ["macro_f1", "accuracy"],
+  "val_metric": {
+    "macro_f1": 0.8,
+    "accuracy": 0.2
+  }
+}

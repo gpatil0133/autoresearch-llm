@@ -42,6 +42,8 @@ from prepare import (
     resolve_dataset_path,
     score_predictions,
 )
+from tasks.common.runtime import build_task_context
+from tasks.common.runtime import resolve_task_profile
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,7 @@ MODEL_REGISTRY_ID: str | None = None
 RUN_TAG = "phase3"
 RANDOM_SEED = 17
 DATASET_CSV_PATH: str | None = None
+TASK_PROFILE = "nlp_analysis"
 
 TRAIN_BATCH_SIZE_OVERRIDE: int | None = None
 LEARNING_RATE_OVERRIDE: float | None = None
@@ -208,6 +211,16 @@ def _runtime_config(selected: Any) -> RuntimeConfig:
         max_sequence_length=min(max_sequence_length, MAX_SEQ_LEN),
         use_lora=use_lora,
     )
+
+
+def _selected_model_payload(selected: Any) -> dict[str, Any]:
+    return {
+        "registry_id": selected.spec.registry_id,
+        "model_name": selected.spec.hf_model_name,
+        "model_family": selected.spec.family.value,
+        "selection_strategy": str(selected.strategy.value),
+        "config": dict(selected.config),
+    }
 
 
 def _pad_token_labels(token_targets: list[torch.Tensor], seq_len: int, device: torch.device) -> torch.Tensor:
@@ -395,6 +408,7 @@ def _summary_print(summary: Mapping[str, Any]) -> None:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run fixed-budget survey training baseline")
+    parser.add_argument("--task-profile", type=str, default=TASK_PROFILE)
     parser.add_argument("--experiment-index", type=int, default=EXPERIMENT_INDEX)
     parser.add_argument(
         "--selection-strategy",
@@ -428,6 +442,7 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
     global MODEL_REGISTRY_ID
     global RUN_TAG
     global RANDOM_SEED
+    global TASK_PROFILE
     global DATASET_CSV_PATH
     global TRAIN_BATCH_SIZE_OVERRIDE
     global LEARNING_RATE_OVERRIDE
@@ -445,6 +460,7 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
     MODEL_REGISTRY_ID = args.model_registry_id
     RUN_TAG = str(args.run_tag)
     RANDOM_SEED = int(args.random_seed)
+    TASK_PROFILE = str(args.task_profile)
     DATASET_CSV_PATH = args.csv_path
     TRAIN_BATCH_SIZE_OVERRIDE = args.train_batch_size
     LEARNING_RATE_OVERRIDE = args.learning_rate
@@ -831,6 +847,26 @@ def _training_loop(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
+    _ = resolve_task_profile(args.task_profile)
+
+    if args.task_profile != "nlp_analysis":
+        _apply_cli_overrides(args)
+        selected = _resolve_selected_model()
+        experiment_id = f"{RUN_TAG}_{EXPERIMENT_INDEX:04d}_standalone_train"
+        context = build_task_context(
+            profile_id=args.task_profile,
+            split="val",
+            csv_path=args.csv_path,
+            run_tag=args.run_tag,
+            experiment_id=experiment_id,
+            root_dir=Path(__file__).resolve().parent,
+        )
+        profile = resolve_task_profile(args.task_profile)
+        summary = profile.train.train(context=context, selected_model=_selected_model_payload(selected))
+        _write_summary_json(summary)
+        _summary_print(summary)
+        return
+
     _apply_cli_overrides(args)
 
     run_start = time.time()

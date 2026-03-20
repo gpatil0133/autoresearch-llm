@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from prepare import ModelFamily, SurveyExample, load_dataset_splits, resolve_dataset_path, score_predictions
+from tasks.common.runtime import build_task_context
+from tasks.common.runtime import resolve_task_profile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -328,6 +330,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 	score_parser.add_argument("--status", type=str, default="completed")
 	score_parser.add_argument("--checkpoint-path", type=str, default="")
 	score_parser.add_argument("--notes", type=str, default="")
+	score_parser.add_argument("--task-profile", type=str, default="nlp_analysis")
 
 	subparsers.add_parser("summary", help="Print concise summary")
 	return parser
@@ -491,11 +494,27 @@ def main(argv: Sequence[str] | None = None) -> None:
 		return
 
 	if args.command == "score":
-		metrics, alignment_stats = evaluate_predictions(
-			predictions_path=args.predictions_path,
-			split=args.split,
-			csv_path=args.csv_path,
-		)
+		_ = resolve_task_profile(args.task_profile)
+		if args.task_profile == "nlp_analysis":
+			metrics, alignment_stats = evaluate_predictions(
+				predictions_path=args.predictions_path,
+				split=args.split,
+				csv_path=args.csv_path,
+			)
+		else:
+			profile = resolve_task_profile(args.task_profile)
+			context = build_task_context(
+				profile_id=args.task_profile,
+				split=args.split,
+				csv_path=args.csv_path,
+				run_tag=args.run_tag,
+				experiment_id=args.experiment_id,
+				root_dir=ROOT_DIR,
+			)
+			metrics, alignment_stats = profile.evaluator.evaluate(
+				context=context,
+				predictions_path=str(args.predictions_path),
+			)
 
 		record = ExperimentRecord(
 			experiment_id=args.experiment_id,
@@ -515,6 +534,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 				"csv_path": args.csv_path or "",
 				"predictions_path": str(args.predictions_path),
 				"alignment_stats": alignment_stats,
+				"task_profile": args.task_profile,
 			},
 			notes=args.notes,
 		)
