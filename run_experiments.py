@@ -24,6 +24,9 @@ from model_selector import SelectionStrategy, select_model
 from tasks.common.runtime import build_task_context
 from tasks.common.runtime import list_task_profile_ids
 from tasks.common.runtime import resolve_task_profile
+from tasks.common.validation import format_validation_report
+from tasks.common.validation import resolve_validation_csv_path
+from tasks.common.validation import validate_task_profile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -132,6 +135,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run autonomous train->inference->eval experiment cycles")
     parser.add_argument("--list-task-profiles", action="store_true")
     parser.add_argument("--task-profile", type=str, default="nlp_analysis")
+    parser.add_argument("--validate-task-profile", action="store_true")
+    parser.add_argument("--validate-all-task-profiles", action="store_true")
+    parser.add_argument("--skip-preflight-checks", action="store_true")
     parser.add_argument("--num-experiments", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument(
@@ -163,6 +169,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _make_experiment_id(run_tag: str, experiment_index: int, registry_id: str) -> str:
     return f"{run_tag}_{experiment_index:04d}_{registry_id}_{_utc_timestamp()}"
+
+
+def _run_profile_validation(profile_id: str, split: str, csv_path: str | None) -> bool:
+    profile = resolve_task_profile(profile_id)
+    resolved_csv_path = resolve_validation_csv_path(
+        profile_id=profile_id,
+        csv_path=csv_path,
+        root_dir=ROOT_DIR,
+    )
+    report = validate_task_profile(
+        profile=profile,
+        split=split,
+        csv_path=resolved_csv_path,
+    )
+    print("---")
+    print(format_validation_report(report))
+    return bool(report.ok)
 
 
 def _train_experiment(
@@ -467,6 +490,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         for profile_id in list_task_profile_ids():
             print(profile_id)
         return
+
+    if bool(args.validate_all_task_profiles):
+        all_ok = True
+        for profile_id in list_task_profile_ids():
+            ok = _run_profile_validation(profile_id=profile_id, split=args.split, csv_path=args.csv_path)
+            all_ok = all_ok and ok
+        if not all_ok:
+            raise SystemExit(2)
+        return
+
+    if bool(args.validate_task_profile):
+        ok = _run_profile_validation(profile_id=args.task_profile, split=args.split, csv_path=args.csv_path)
+        if not ok:
+            raise SystemExit(2)
+        return
+
+    if not bool(args.skip_preflight_checks):
+        ok = _run_profile_validation(profile_id=args.task_profile, split=args.split, csv_path=args.csv_path)
+        if not ok:
+            raise SystemExit(2)
 
     args.state_path = Path(args.state_path)
     args.results_path = Path(args.results_path)

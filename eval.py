@@ -23,6 +23,9 @@ from typing import Any, Mapping, Sequence
 from prepare import ModelFamily, SurveyExample, load_dataset_splits, resolve_dataset_path, score_predictions
 from tasks.common.runtime import build_task_context
 from tasks.common.runtime import resolve_task_profile
+from tasks.common.validation import format_validation_report
+from tasks.common.validation import resolve_validation_csv_path
+from tasks.common.validation import validate_task_profile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -494,7 +497,18 @@ def main(argv: Sequence[str] | None = None) -> None:
 		return
 
 	if args.command == "score":
-		_ = resolve_task_profile(args.task_profile)
+		resolved_profile = resolve_task_profile(args.task_profile)
+		preflight = validate_task_profile(
+			profile=resolved_profile,
+			split=args.split,
+			csv_path=resolve_validation_csv_path(
+				profile_id=args.task_profile,
+				csv_path=args.csv_path,
+				root_dir=ROOT_DIR,
+			),
+		)
+		if not preflight.ok:
+			raise ValueError(f"task-profile preflight failed\n{format_validation_report(preflight)}")
 		if args.task_profile == "nlp_analysis":
 			metrics, alignment_stats = evaluate_predictions(
 				predictions_path=args.predictions_path,
@@ -502,7 +516,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 				csv_path=args.csv_path,
 			)
 		else:
-			profile = resolve_task_profile(args.task_profile)
+			profile = resolved_profile
 			context = build_task_context(
 				profile_id=args.task_profile,
 				split=args.split,

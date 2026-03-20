@@ -143,6 +143,28 @@ DEFAULT_MODEL_REGISTRY: tuple[ModelSpec, ...] = (
 		},
 	),
 	ModelSpec(
+		registry_id="encoder_tiny_distilbert",
+		hf_model_name="sshleifer/tiny-distilbert-base-cased",
+		family=ModelFamily.ENCODER,
+		description="Ultra-tiny encoder baseline for CPU smoke tests on low-memory machines.",
+		overrides={
+			"learning_rate": 3e-5,
+			"batch_size": 1,
+			"max_sequence_length": min(64, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
+		registry_id="encoder_distilbert_base",
+		hf_model_name="distilbert-base-uncased",
+		family=ModelFamily.ENCODER,
+		description="CPU-friendly encoder baseline for local development smoke runs.",
+		overrides={
+			"learning_rate": 3e-5,
+			"batch_size": 1,
+			"max_sequence_length": min(128, MAX_SEQ_LEN),
+		},
+	),
+	ModelSpec(
 		registry_id="decoder_mistral_7b",
 		hf_model_name="mistral-7b",
 		family=ModelFamily.DECODER,

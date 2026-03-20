@@ -72,7 +72,34 @@ uv run eval.py summary
 
 # 6) Run autonomous phase-6 loop (example: two short encoder/decoder cycles)
 uv run run_experiments.py --num-experiments 2 --run-tag phase6 --split val
+
+# 7) Validate task profile preflight before long runs
+uv run run_experiments.py --task-profile nlp_analysis --validate-task-profile --split val
+
+# 8) Smoke-check all task profiles (validation-only)
+uv run smoke_profiles.py --split val
 ```
+
+## Task profile operations
+
+- List available profiles:
+	```bash
+	uv run run_experiments.py --list-task-profiles
+	```
+- Validate one profile:
+	```bash
+	uv run run_experiments.py --task-profile tagging --csv-path data/tagging_dataset.csv --validate-task-profile --split val
+	```
+- Validate all built-in profiles:
+	```bash
+	uv run run_experiments.py --validate-all-task-profiles --split val
+	```
+- Skip automatic preflight in experiment loop (not recommended):
+	```bash
+	uv run run_experiments.py --task-profile generic --csv-path data/generic_task.csv --skip-preflight-checks
+	```
+
+See `docs/TASK_PROFILE_AUTHORING.md` for adapter contracts and profile authoring conventions.
 
 ## Phase status
 
@@ -82,6 +109,7 @@ uv run run_experiments.py --num-experiments 2 --run-tag phase6 --split val
 - Phase 4: complete (structured inference in `inference.py`).
 - Phase 5: complete (task-level evaluation + schema compliance logging in `eval.py`).
 - Phase 6: complete (`run_experiments.py` orchestrates select -> train -> inference -> eval/log with non-destructive keep/discard states).
+- Phase 7: complete (profile validation CLI, preflight checks, and profile smoke utility).
 
 ## Notes for model choice
 

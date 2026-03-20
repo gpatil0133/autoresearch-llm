@@ -44,6 +44,9 @@ from prepare import (
 )
 from tasks.common.runtime import build_task_context
 from tasks.common.runtime import resolve_task_profile
+from tasks.common.validation import format_validation_report
+from tasks.common.validation import resolve_validation_csv_path
+from tasks.common.validation import validate_task_profile
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +850,18 @@ def _training_loop(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
-    _ = resolve_task_profile(args.task_profile)
+    resolved_profile = resolve_task_profile(args.task_profile)
+    preflight = validate_task_profile(
+        profile=resolved_profile,
+        split="train",
+        csv_path=resolve_validation_csv_path(
+            profile_id=args.task_profile,
+            csv_path=args.csv_path,
+            root_dir=Path(__file__).resolve().parent,
+        ),
+    )
+    if not preflight.ok:
+        raise ValueError(f"task-profile preflight failed\n{format_validation_report(preflight)}")
 
     if args.task_profile != "nlp_analysis":
         _apply_cli_overrides(args)
@@ -861,7 +875,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             experiment_id=experiment_id,
             root_dir=Path(__file__).resolve().parent,
         )
-        profile = resolve_task_profile(args.task_profile)
+        profile = resolved_profile
         summary = profile.train.train(context=context, selected_model=_selected_model_payload(selected))
         _write_summary_json(summary)
         _summary_print(summary)
