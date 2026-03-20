@@ -99,7 +99,7 @@ uv run smoke_profiles.py --split val
 	uv run run_experiments.py --task-profile generic --csv-path data/generic_task.csv --skip-preflight-checks
 	```
 
-See `docs/TASK_PROFILE_AUTHORING.md` for adapter contracts and profile authoring conventions.
+See `docs/TASK_AGNOSTIC_AUTORESEARCH.md` for the full system architecture/runtime guide, and `docs/TASK_PROFILE_AUTHORING.md` for adapter contracts and profile authoring conventions.
 
 ## Phase status
 
